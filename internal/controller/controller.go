@@ -50,7 +50,13 @@ type Controller struct {
 
 // New builds a controller.
 func New(cfg *config.Config, deps Deps, log *logx.Logger, reg *metrics.Registry) *Controller {
-	return &Controller{cfg: cfg, deps: deps, log: log, reg: reg, role: elect.RoleUnknown, lag: -1, rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
+	c := &Controller{cfg: cfg, deps: deps, log: log, reg: reg, role: elect.RoleUnknown, lag: -1, rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
+	// Stable exposition from boot.
+	reg.SetGauge("is_leader", 0)
+	reg.SetGauge("kvrocks_up", 0)
+	reg.SetGauge("replication_lag_bytes", -1)
+	reg.SetGaugeFloat("lock_held_seconds", 0)
+	return c
 }
 
 func (c *Controller) Snapshot() httpapi.Snapshot {
