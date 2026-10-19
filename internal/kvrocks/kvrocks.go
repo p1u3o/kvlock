@@ -68,17 +68,23 @@ type Client interface {
 type RedisClient struct {
 	rdb     *redis.Client
 	timeout time.Duration
+	kind    string // "kvrocks" or "redis"
 }
 
 // New creates a client for addr:port with optional password.
-func New(addr string, port int, password string, timeout time.Duration) *RedisClient {
+// kind is "kvrocks" (default) or "redis"; unknown kinds behave like kvrocks.
+func New(addr string, port int, password string, timeout time.Duration, kind ...string) *RedisClient {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:        fmt.Sprintf("%s:%d", addr, port),
 		Password:    password,
 		DialTimeout: timeout,
 		ReadTimeout: timeout,
 	})
-	return &RedisClient{rdb: rdb, timeout: timeout}
+	k := "kvrocks"
+	if len(kind) > 0 && kind[0] != "" {
+		k = kind[0]
+	}
+	return &RedisClient{rdb: rdb, timeout: timeout, kind: k}
 }
 
 func (c *RedisClient) ctx(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -130,6 +136,11 @@ func (c *RedisClient) Promote(ctx context.Context) error {
 }
 
 func (c *RedisClient) EnsureRsIDPsync(ctx context.Context) error {
+	// kvrocks-only setting for partial resync on failover; Redis has no
+	// such config, so skip it there instead of logging a failure.
+	if c.kind == "redis" {
+		return nil
+	}
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
 	// CONFIG GET to check first; ignore errors (old versions may hide it).

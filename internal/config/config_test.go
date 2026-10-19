@@ -44,3 +44,19 @@ func TestAdvertiseDefaults(t *testing.T) {
 		t.Fatalf("advertise=%v:%v", c.AdvertiseAddr, c.AdvertisePort)
 	}
 }
+
+func TestKVKind(t *testing.T) {
+	c, err := config.Parse([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.KVKind != "kvrocks" {
+		t.Fatalf("default kind=%q", c.KVKind)
+	}
+	if _, err := config.Parse([]string{"--kv-kind=redis"}); err != nil {
+		t.Fatalf("redis kind rejected: %v", err)
+	}
+	if _, err := config.Parse([]string{"--kv-kind=memcached"}); err == nil {
+		t.Fatal("expected error for bogus kind")
+	}
+}

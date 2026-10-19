@@ -22,6 +22,7 @@ type Config struct {
 	KvrocksPassword     string
 	KvrocksPasswordFile string
 	KvrocksTimeout      time.Duration
+	KVKind              string // "kvrocks" or "redis"
 
 	NodeName      string
 	AdvertiseAddr string
@@ -111,6 +112,7 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.KvrocksPassword, "kvrocks-password", getenv("KVROCKS_PASSWORD", ""), "kvrocks password ($KVROCKS_PASSWORD)")
 	fs.StringVar(&c.KvrocksPasswordFile, "kvrocks-password-file", getenv("KVROCKS_PASSWORD_FILE", ""), "File containing kvrocks password ($KVROCKS_PASSWORD_FILE)")
 	fs.DurationVar(&c.KvrocksTimeout, "kvrocks-timeout", getenvDur("KVROCKS_TIMEOUT", 2*time.Second), "Per-command kvrocks timeout ($KVROCKS_TIMEOUT)")
+	fs.StringVar(&c.KVKind, "kv-kind", getenv("KV_KIND", "kvrocks"), "Backend: kvrocks|redis ($KV_KIND)")
 
 	fs.StringVar(&c.NodeName, "node", getenv("NODE_NAME", getenv("HOSTNAME", "kv01")), "Local node name ($NODE_NAME)")
 	fs.StringVar(&c.AdvertiseAddr, "advertise-addr", getenv("ADVERTISE_ADDR", ""), "Address to advertise as master ($ADVERTISE_ADDR, default: kvrocks addr)")
@@ -164,6 +166,9 @@ func Parse(args []string) (*Config, error) {
 	}
 	if c.Mode != "active" && c.Mode != "observe" {
 		return nil, fmt.Errorf("invalid --mode %q: want active|observe", c.Mode)
+	}
+	if c.KVKind != "kvrocks" && c.KVKind != "redis" {
+		return nil, fmt.Errorf("invalid --kv-kind %q: want kvrocks|redis", c.KVKind)
 	}
 	if c.SessionTTL < 5*time.Second {
 		return nil, fmt.Errorf("session TTL %v too short: minimum 5s", c.SessionTTL)

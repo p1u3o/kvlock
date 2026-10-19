@@ -61,6 +61,24 @@ Target kvrocks 2.7.0+ (has `REPLICAOF`). Older than 2.11 works via the
 `SLAVEOF` fallback but is untested — verify `INFO replication` output on
 your version before production cutover.
 
+### Running against standalone Redis
+
+The sidecar also works against a standalone Redis pair (not Cluster —
+it knows nothing about hash slots):
+
+```sh
+kvrocks-leader --kv-kind=redis --kvrocks-port 6379 --cluster main ...
+```
+
+(`--kv-kind=redis`, `$KV_KIND=redis`.) The only backend-specific step is
+`CONFIG SET use-rsid-psync yes`, which is skipped for `redis` since Redis
+has no such setting. Everything else — `PING`, `INFO replication` lag
+parsing (Redis reliably reports `slave_repl_offset`, so the lag gate is
+exact rather than unknown), `REPLICAOF` (≥ Redis 5, `SLAVEOF` fallback
+below that), `replica-read-only`/`slave-read-only` — is shared. Re-run
+the failure-mode scenarios against Redis before relying on the timings
+above, as PSYNC/full-sync dynamics differ from kvrocks.
+
 ## Split-brain window (honest)
 
 Consul sessions + TTL checks are AP-ish during partitions. Worst case: the

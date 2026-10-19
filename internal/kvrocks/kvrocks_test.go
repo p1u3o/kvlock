@@ -1,7 +1,9 @@
 package kvrocks_test
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/example/kvrocks-leader/internal/kvrocks"
 )
@@ -52,5 +54,14 @@ func TestParseUnknownLag(t *testing.T) {
 	ri := kvrocks.ParseInfoReplication("# Replication\nrole:slave\nmaster_host:10.0.0.1\n")
 	if ri.LagBytes != -1 {
 		t.Fatalf("expected unknown lag, got %d", ri.LagBytes)
+	}
+}
+
+func TestEnsureRsIDPsyncRedisNoop(t *testing.T) {
+	// Must not touch the network for redis (no such config there).
+	c := kvrocks.New("127.0.0.1", 1, "", time.Second, "redis")
+	defer c.Close()
+	if err := c.EnsureRsIDPsync(context.Background()); err != nil {
+		t.Fatalf("redis kind should skip use-rsid-psync, got %v", err)
 	}
 }
