@@ -1,0 +1,77 @@
+name: kvrocks-leader-integration
+
+# Test env only. Production kvrocks listens on 6666; tests use 8379+ so a
+# stray test can never touch production.
+services:
+  consul-test:
+    image: hashicorp/consul:1.18
+    command: ["agent", "-dev", "-client=0.0.0.0", "-hcl", "acl { enabled = false }"]
+    ports:
+      - "18500:8500"
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  kvrocks-a:
+    image: apache/kvrocks:2.7.0
+    command: ["--bind", "0.0.0.0", "--port", "8379", "--daemonize", "no", "--use-rsid-psync", "yes", "--requirepass", ""]
+    ports:
+      - "18379:8379"
+    depends_on:
+      consul-test:
+        condition: service_healthy
+
+  kvrocks-b:
+    image: apache/kvrocks:2.7.0
+    command: ["--bind", "0.0.0.0", "--port", "8379", "--daemonize", "no", "--use-rsid-psync", "yes", "--requirepass", ""]
+    ports:
+      - "18380:8379"
+    depends_on:
+      consul-test:
+        condition: service_healthy
+
+  sidecar-a:
+    build: .
+    depends_on:
+      consul-test:
+        condition: service_healthy
+      kvrocks-a:
+        condition: service_started
+    environment:
+      CONSUL_HTTP_ADDR: "http://consul-test:8500"
+      KVROCKS_ADDR: "kvrocks-a"
+      KVROCKS_PORT: "8379"
+      NODE_NAME: "kv01"
+      ADVERTISE_ADDR: "kvrocks-a"
+      ADVERTISE_PORT: "8379"
+      CLUSTER_NAME: "test"
+      HTTP_ADDR: ":8080"
+      SESSION_TTL: "10s"
+      LOCK_DELAY: "1s"
+      CHECK_INTERVAL: "2s"
+      HOLD_DOWN: "10s"
+      MODE: "active"
+
+  sidecar-b:
+    build: .
+    depends_on:
+      consul-test:
+        condition: service_healthy
+      kvrocks-b:
+        condition: service_started
+    environment:
+      CONSUL_HTTP_ADDR: "http://consul-test:8500"
+      KVROCKS_ADDR: "kvrocks-b"
+      KVROCKS_PORT: "8379"
+      NODE_NAME: "kv02"
+      ADVERTISE_ADDR: "kvrocks-b"
+      ADVERTISE_PORT: "8379"
+      CLUSTER_NAME: "test"
+      HTTP_ADDR: ":8080"
+      SESSION_TTL: "10s"
+      LOCK_DELAY: "1s"
+      CHECK_INTERVAL: "2s"
+      HOLD_DOWN: "10s"
+      MODE: "active"
