@@ -1,0 +1,309 @@
+package controller_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/example/kvrocks-leader/internal/config"
+	"github.com/example/kvrocks-leader/internal/controller"
+	"github.com/example/kvrocks-leader/internal/elect"
+	"github.com/example/kvrocks-leader/internal/kvrocks"
+	"github.com/example/kvrocks-leader/internal/logx"
+	"github.com/example/kvrocks-leader/internal/metrics"
+)
+
+// --- fakes ---
+
+type fakeSession struct {
+	mu        sync.Mutex
+	id        string
+	renewErr  error
+	valid     bool
+	destroyed bool
+}
+
+func (f *fakeSession) Create(ctx context.Context, ttl, ld time.Duration) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.id = "sess-1"
+	f.valid = true
+	return f.id, nil
+}
+func (f *fakeSession) Renew(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.renewErr != nil {
+		return f.renewErr
+	}
+	if !f.valid {
+		return errInvalid
+	}
+	return nil
+}
+func (f *fakeSession) Destroy(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.destroyed = true
+	f.valid = false
+	return nil
+}
+func (f *fakeSession) Valid(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.valid && id == f.id
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
+
+const errInvalid = errString("invalid session")
+
+type fakeLock struct {
+	mu       sync.Mutex
+	val      []byte
+	sess     string
+	idx      uint64
+	acquires int
+}
+
+func (f *fakeLock) Acquire(ctx context.Context, key, sess string, v []byte) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.acquires++
+	if f.sess != "" && f.sess != sess {
+		return false, nil
+	}
+	f.val = v
+	f.sess = sess
+	f.idx++
+	return true, nil
+}
+func (f *fakeLock) Release(ctx context.Context, key, sess string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sess == sess {
+		f.val = nil
+		f.sess = ""
+	}
+	return nil
+}
+func (f *fakeLock) Get(ctx context.Context, key string) ([]byte, string, uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.val, f.sess, f.idx, nil
+}
+func (f *fakeLock) Watch(ctx context.Context, key string, wi uint64, wt time.Duration) ([]byte, string, uint64, error) {
+	<-ctx.Done()
+	return nil, "", wi, ctx.Err()
+}
+
+type fakeRegistrar struct {
+	mu              sync.Mutex
+	master, replica int
+	dereg           int
+	failed, passed  int
+}
+
+func (f *fakeRegistrar) RegisterMaster(ctx context.Context, s, n, a string, p int, t []string, ttl time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.master++
+	return nil
+}
+func (f *fakeRegistrar) RegisterReplica(ctx context.Context, s, n, a string, p int, t []string, ttl time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replica++
+	return nil
+}
+func (f *fakeRegistrar) PassTTL(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.passed++
+	return nil
+}
+func (f *fakeRegistrar) FailTTL(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failed++
+	return nil
+}
+func (f *fakeRegistrar) Deregister(ctx context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dereg++
+	return nil
+}
+func (f *fakeRegistrar) CheckID(id string) string { return "service:" + id }
+
+type fakeKV struct {
+	mu         sync.Mutex
+	up         bool
+	role       string
+	masterHost string
+	masterPort int
+	lag        int64
+	promotions int
+	follows    int
+	readonly   bool
+}
+
+func (f *fakeKV) Ping(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.up {
+		return errString("down")
+	}
+	return nil
+}
+func (f *fakeKV) InfoReplication(ctx context.Context) (*kvrocks.ReplicationInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.up {
+		return nil, errString("down")
+	}
+	return &kvrocks.ReplicationInfo{Role: f.role, MasterHost: f.masterHost, MasterPort: f.masterPort, LagBytes: f.lag, MasterLinkUp: true}, nil
+}
+func (f *fakeKV) ReplicaOf(ctx context.Context, h string, p int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.follows++
+	if p == 0 {
+		f.role = "master"
+	} else {
+		f.role = "slave"
+		f.masterHost = h
+		f.masterPort = p
+	}
+	return nil
+}
+func (f *fakeKV) Promote(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.promotions++
+	f.role = "master"
+	f.readonly = false
+	return nil
+}
+func (f *fakeKV) EnsureRsIDPsync(ctx context.Context) error { return nil }
+func (f *fakeKV) SetReadOnly(ctx context.Context, ro bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readonly = ro
+	return nil
+}
+func (f *fakeKV) Close() error { return nil }
+
+func testConfig(node string) *config.Config {
+	return &config.Config{
+		ConsulAddr: "127.0.0.1:8500", KvrocksAddr: "127.0.0.1", KvrocksPort: 6666,
+		KvrocksTimeout: time.Second, NodeName: node, AdvertiseAddr: "10.0.0.1", AdvertisePort: 6666,
+		Cluster: "main", SessionTTL: 10 * time.Second, LockDelay: time.Second,
+		UnhealthyThreshold: 2, MaxLagBytes: 1000, HoldDown: 50 * time.Millisecond,
+		ServiceName: "kvrocks", MasterTag: "master", ReplicaTag: "replica",
+		Mode: "active", MinLeaderTime: time.Second,
+		ReelectBaseBackoff: time.Millisecond, ReelectMaxBackoff: 5 * time.Millisecond,
+		HTTPAddr: ":0", CheckInterval: 20 * time.Millisecond,
+	}
+}
+
+func runCtl(t *testing.T, cfg *config.Config, deps controller.Deps, d time.Duration) (*controller.Controller, *fakeLock, *fakeRegistrar, *fakeKV) {
+	t.Helper()
+	c := controller.New(cfg, deps, logx.New(cfg.NodeName, cfg.Mode), metrics.New())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); c.Run(ctx) }()
+	time.Sleep(d)
+	cancel()
+	<-done
+	return c, deps.Lock.(*fakeLock), deps.Registrar.(*fakeRegistrar), deps.KV.(*fakeKV)
+}
+
+func TestSingleNodeBecomesLeader(t *testing.T) {
+	cfg := testConfig("kv01")
+	kv := &fakeKV{up: true, role: "master", lag: 0}
+	deps := controller.Deps{Session: &fakeSession{}, Lock: &fakeLock{}, Registrar: &fakeRegistrar{}, KV: kv}
+	c, _, reg, _ := runCtl(t, cfg, deps, 200*time.Millisecond)
+	snap := c.Snapshot()
+	if snap.Role != elect.RoleLeader {
+		t.Fatalf("expected leader, got %v", snap.Role)
+	}
+	if reg.master == 0 {
+		t.Fatal("expected master registration")
+	}
+}
+
+func TestFollowerPointsAtLeader(t *testing.T) {
+	cfg := testConfig("kv02")
+	kv := &fakeKV{up: true, role: "slave", masterHost: "other", masterPort: 1, lag: 10}
+	lock := &fakeLock{}
+	lv := elect.MarshalLeader("kv01", "10.0.0.9", 6666, "sess-x", 3, time.Now())
+	lock.val = lv
+	lock.sess = "sess-x"
+	deps := controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv}
+	c, _, _, fkv := runCtl(t, cfg, deps, 200*time.Millisecond)
+	if c.Snapshot().Role != elect.RoleFollower {
+		t.Fatalf("expected follower, got %v", c.Snapshot().Role)
+	}
+	fkv.mu.Lock()
+	follows := fkv.follows
+	host := fkv.masterHost
+	fkv.mu.Unlock()
+	if follows == 0 || host != "10.0.0.9" {
+		t.Fatalf("expected follow of 10.0.0.9, follows=%d host=%q", follows, host)
+	}
+}
+
+func TestUnhealthyReleasesAndDemotes(t *testing.T) {
+	cfg := testConfig("kv01")
+	kv := &fakeKV{up: true, role: "master", lag: 0}
+	sess := &fakeSession{}
+	lock := &fakeLock{}
+	reg := &fakeRegistrar{}
+	deps := controller.Deps{Session: sess, Lock: lock, Registrar: reg, KV: kv}
+	c := controller.New(cfg, deps, logx.New("kv01", "active"), metrics.New())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); c.Run(ctx) }()
+	time.Sleep(150 * time.Millisecond)
+	if c.Snapshot().Role != elect.RoleLeader {
+		cancel()
+		<-done
+		t.Fatal("precondition: should be leader first")
+	}
+	kv.mu.Lock()
+	kv.up = false
+	kv.mu.Unlock()
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	<-done
+	if c.Snapshot().Role == elect.RoleLeader {
+		t.Fatal("expected demote after sustained unhealthiness")
+	}
+	reg.mu.Lock()
+	failed := reg.failed
+	dereg := reg.dereg
+	reg.mu.Unlock()
+	if failed == 0 || dereg == 0 {
+		t.Fatalf("expected fail+deregister on demote, got fail=%d dereg=%d", failed, dereg)
+	}
+}
+
+func TestPromotionRefusedWhenFarBehind(t *testing.T) {
+	// Pure gate: known huge lag + recently-seen old master => refuse.
+	dec := elect.ShouldPromote(99999999, 1000, time.Now(), time.Hour, time.Now(), true)
+	if dec.Allow {
+		t.Fatal("expected refusal for far-behind replica")
+	}
+	// Fresh cluster (node is master, lag unknown, no old master) elects.
+	cfg := testConfig("kv02")
+	kv := &fakeKV{up: true, role: "master", lag: -1}
+	deps := controller.Deps{Session: &fakeSession{}, Lock: &fakeLock{}, Registrar: &fakeRegistrar{}, KV: kv}
+	c, _, _, _ := runCtl(t, cfg, deps, 150*time.Millisecond)
+	if c.Snapshot().Role != elect.RoleLeader {
+		t.Fatal("fresh cluster should elect a leader")
+	}
+}
