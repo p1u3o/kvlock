@@ -163,6 +163,12 @@ func (l *Client) BumpEpoch(ctx context.Context, key string, min uint64) (uint64,
 	return 0, errors.New("epoch counter: check-and-set kept losing")
 }
 
+// Put writes key without a session.
+func (l *Client) Put(ctx context.Context, key string, value []byte) error {
+	_, err := l.c.KV().Put(&consul.KVPair{Key: key, Value: value}, (&consul.WriteOptions{}).WithContext(ctx))
+	return err
+}
+
 func (l *Client) Get(ctx context.Context, key string) ([]byte, string, uint64, error) {
 	p, meta, err := l.c.KV().Get(key, (&consul.QueryOptions{}).WithContext(ctx))
 	if err != nil {

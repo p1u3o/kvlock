@@ -85,3 +85,8 @@ type Registrar interface {
 	// CheckID returns the TTL check id for serviceID.
 	CheckID(serviceID string) string
 }
+
+// KVWriter writes plain (unlocked) keys, e.g. the last-backup record.
+type KVWriter interface {
+	Put(ctx context.Context, key string, value []byte) error
+}

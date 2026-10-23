@@ -57,6 +57,12 @@ type Registry struct {
 	ProxyDropped   *prometheus.CounterVec // listener
 	ProxyRefused   *prometheus.CounterVec // listener
 
+	// Backups (all zero while backups are disabled).
+	BackupLastSuccess prometheus.Gauge
+	BackupLastSize    prometheus.Gauge
+	BackupDuration    prometheus.Gauge
+	BackupFailures    prometheus.Counter
+
 	connMu sync.Mutex
 	conns  map[string]float64
 
@@ -87,6 +93,11 @@ func New() *Registry {
 	r.ProxyDropped = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "proxy_dropped_connections_total", Help: "Proxied connections closed because the routing target changed (failover, fencing, lost Consul confirmation)."}, []string{"listener"})
 	r.ProxyRefused = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "proxy_refused_connections_total", Help: "Connections refused because no safe target was known or the dial failed."}, []string{"listener"})
 
+	r.BackupLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "backup_last_success_timestamp_seconds", Help: "Unix time of this node's last successful backup upload; 0 never."})
+	r.BackupLastSize = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "backup_last_size_bytes", Help: "Size of this node's last uploaded backup object (encrypted)."})
+	r.BackupDuration = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "backup_duration_seconds", Help: "Duration of this node's last successful backup (BGSAVE + upload)."})
+	r.BackupFailures = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "backup_failures_total", Help: "Failed backup attempts on this node."})
+
 	renew := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: Namespace, Name: "consul_last_renew_age_seconds", Help: "Seconds since Consul last confirmed our session; +Inf before the first success."},
 		func() float64 { return call(&r.renewAge, math.Inf(1)) })
 	held := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: Namespace, Name: "lock_held_seconds", Help: "Seconds this node has held the leader lock; 0 when not leader."},
@@ -95,6 +106,7 @@ func New() *Registry {
 	r.prom.MustRegister(r.IsLeader, r.BackendUp, r.ReplicationLag, r.Elections, r.LeaderAcquired, r.LeaderChanges,
 		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, r.ProxyActive, r.ProxyDropped, r.ProxyRefused, renew, held,
 		r.LagSeconds, r.HeartbeatAge, r.Heartbeats, r.LagRefusals,
+		r.BackupLastSuccess, r.BackupLastSize, r.BackupDuration, r.BackupFailures,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	r.ReplicationLag.Set(-1)
