@@ -101,6 +101,19 @@ its own offset. Writes the old leader accepted after the last sample are not
 counted, so lag can be under-estimated by up to one tick of writes. With no
 sample (e.g. just started) lag is unknown and the `--hold-down` applies.
 
+At promotion time the gate measures again: its own offset comes from the
+current tick, and if the departed leader's kvrocks still answers as a master
+it is re-sampled. If the last sample was older than `--lag-sample-max-age`
+(default 3x `--check-interval`) when the leader was last seen, for example
+because its kvrocks stopped answering before its session went away, a lag
+that looks within bound counts as unknown and the hold-down applies. A lag
+already over the bound stays a refusal.
+
+A replica over `--max-lag` refuses until the old leader comes back, or until
+it has been gone for `--lag-gate-max-wait` (default 5m). After that it promotes
+anyway, and the writes the old leader never replicated are lost. Set it to 0
+to wait forever.
+
 ### Running against standalone Redis
 
 The sidecar also works against a standalone Redis pair (not Cluster —
@@ -144,7 +157,7 @@ a Nomad sidecar so it is restarted with kvrocks.
 | Consul outage longer than TTL | Leader fences itself; sessions re-created on return; re-election with backoff | ~outage + seconds |
 | SIGTERM on leader | Deregister, fence, kill clients, release | ~1–2s |
 | Both start simultaneously | Empty key race; Consul acquire is atomic — one wins, epoch 1 | ~seconds |
-| Replica far behind (`lag > --max-lag`) | Promotion refused, stays follower, warns; retries each tick | operator must resync |
+| Replica far behind (`lag > --max-lag`) | Promotion refused, stays follower, warns; retries each tick; promotes after `--lag-gate-max-wait` (default 5m, 0 = never) | ≤ max wait, loses the unreplicated writes |
 | Lag unknown + old master recently seen | Refused until `--hold-down` (default 30s) elapses | ≤ hold-down |
 
 ## Running

@@ -50,6 +50,44 @@ func ShouldPromote(lagBytes int64, maxLag int64, masterLastSeen time.Time, holdD
 	return PromotionDecision{false, "replica too far behind last known master"}
 }
 
+// LagGateInput is everything the promotion lag gate looks at.
+type LagGateInput struct {
+	Lag    int64 // local lag behind the leader sample; < 0 unknown
+	MaxLag int64
+	// SampleAge is how old the leader offset sample was when the leader was
+	// last seen (< 0 unknown). A stale sample can understate the lag.
+	SampleAge    time.Duration
+	MaxSampleAge time.Duration // 0 disables the staleness check
+	LastSeen     time.Time     // when the old leader was last seen
+	HaveOld      bool
+	HoldDown     time.Duration
+	// MaxWait bounds how long a known-too-far-behind replica refuses: once
+	// the old leader has been gone this long, promote anyway. 0 = never.
+	MaxWait time.Duration
+	Now     time.Time
+}
+
+// LagGate decides whether a replica may promote. It extends ShouldPromote
+// with sample staleness (a sample older than MaxSampleAge counts as unknown
+// lag, so the hold-down applies) and a bounded wait for a lagging replica.
+func LagGate(in LagGateInput) PromotionDecision {
+	lag := in.Lag
+	stale := false
+	// Only a sample that looks good can mislead: a stale sample understates
+	// lag, so one already over the bound stays a refusal.
+	if lag >= 0 && lag <= in.MaxLag && in.MaxSampleAge > 0 && (in.SampleAge < 0 || in.SampleAge > in.MaxSampleAge) {
+		lag, stale = -1, true
+	}
+	d := ShouldPromote(lag, in.MaxLag, in.LastSeen, in.HoldDown, in.Now, in.HaveOld)
+	if stale {
+		d.Reason = "leader offset sample stale; " + d.Reason
+	}
+	if !d.Allow && lag > in.MaxLag && in.MaxWait > 0 && in.HaveOld && !in.LastSeen.IsZero() && in.Now.Sub(in.LastSeen) >= in.MaxWait {
+		return PromotionDecision{true, "lag gate max wait exceeded; promoting behind the last known master"}
+	}
+	return d
+}
+
 // NextEpoch bumps the epoch for a new leader. Empty/invalid old value -> 1.
 func NextEpoch(raw []byte) uint64 {
 	if len(raw) == 0 {

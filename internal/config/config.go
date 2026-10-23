@@ -39,6 +39,12 @@ type Config struct {
 
 	MaxLagBytes int64
 	HoldDown    time.Duration
+	// LagSampleMaxAge: a leader offset sample older than this when the
+	// leader disappeared is treated as unknown lag. 0 disables.
+	LagSampleMaxAge time.Duration
+	// LagGateMaxWait: promote a lagging replica anyway once the old leader
+	// has been gone this long. 0 = refuse until it returns.
+	LagGateMaxWait time.Duration
 
 	ServiceName string
 	MasterTag   string
@@ -166,6 +172,8 @@ func Parse(args []string) (*Config, error) {
 
 	fs.Int64Var(&c.MaxLagBytes, "max-lag", getenvInt64("MAX_LAG", getenvInt64("MAX_LAG_BYTES", -1)), "Max replication lag tolerated before refusing promotion, in the backend's offset units: write sequence numbers for kvrocks (default 1000), bytes for Redis (default 100MiB) ($MAX_LAG)")
 	fs.Int64Var(&c.MaxLagBytes, "max-lag-bytes", c.MaxLagBytes, "Old name for --max-lag ($MAX_LAG_BYTES)")
+	fs.DurationVar(&c.LagSampleMaxAge, "lag-sample-max-age", getenvDur("LAG_SAMPLE_MAX_AGE", 0), "Treat the leader offset sample as unknown lag if it was older than this when the leader disappeared; 0 = 3x --check-interval ($LAG_SAMPLE_MAX_AGE)")
+	fs.DurationVar(&c.LagGateMaxWait, "lag-gate-max-wait", getenvDur("LAG_GATE_MAX_WAIT", 5*time.Minute), "Promote a replica that is over --max-lag anyway once the old leader has been gone this long, accepting the loss of its unreplicated writes; 0 = wait forever ($LAG_GATE_MAX_WAIT)")
 	fs.DurationVar(&c.HoldDown, "hold-down", getenvDur("HOLD_DOWN", 30*time.Second), "Promote with unknown lag only if old master unreachable this long ($HOLD_DOWN)")
 
 	fs.StringVar(&c.ProxyAddr, "proxy-addr", getenv("PROXY_ADDR", ""), "Listen address for the TCP leader proxy, e.g. :6380 ($PROXY_ADDR, default: disabled)")
@@ -255,6 +263,12 @@ func Parse(args []string) (*Config, error) {
 		if c.KVKind == "redis" {
 			c.MaxLagBytes = 104857600
 		}
+	}
+	if c.LagSampleMaxAge <= 0 {
+		c.LagSampleMaxAge = 3 * c.CheckInterval
+	}
+	if c.LagGateMaxWait < 0 {
+		return nil, fmt.Errorf("--lag-gate-max-wait must be >= 0")
 	}
 	if c.HandoverMaxLag < 0 {
 		c.HandoverMaxLag = c.MaxLagBytes

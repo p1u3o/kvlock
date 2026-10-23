@@ -278,7 +278,7 @@ func (c *Controller) onHandoverHint(ctx context.Context, ri *kvrocks.Replication
 		return true
 	}
 	c.mu.Lock()
-	c.peerOffset, c.peerSampled = lv.HandoverOffset, true
+	c.peerOffset, c.peerSampled, c.peerAt = lv.HandoverOffset, true, time.Now()
 	c.mu.Unlock()
 	return false
 }

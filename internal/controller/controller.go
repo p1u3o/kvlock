@@ -65,6 +65,7 @@ type Controller struct {
 	// the leader disappears.
 	peerOffset  int64
 	peerSampled bool
+	peerAt      time.Time // when peerOffset was taken
 	peerSession string
 
 	rng *rand.Rand
@@ -343,6 +344,7 @@ func (c *Controller) sampleLeader(ctx context.Context, holder string, target *co
 		c.peerSession = holder
 		c.peerSampled = false
 		c.peerOffset = -1
+		c.peerAt = time.Time{}
 	}
 	c.mu.Unlock()
 	if target == nil {
@@ -361,6 +363,35 @@ func (c *Controller) sampleLeader(ctx context.Context, holder string, target *co
 	c.mu.Lock()
 	c.peerOffset = pi.MasterOffset
 	c.peerSampled = true
+	c.peerAt = time.Now()
+	c.mu.Unlock()
+}
+
+// resampleOld takes a fresh offset sample from the departed leader if its
+// kvrocks still answers as a master. Failure keeps the previous sample.
+// It only refreshes an existing sample of that leader: with no sample the
+// lag stays unknown and the hold-down applies, as before.
+func (c *Controller) resampleOld(ctx context.Context, old *consulstore.LeaderValue) {
+	c.mu.RLock()
+	have := c.peerSampled
+	c.mu.RUnlock()
+	if !have {
+		return
+	}
+	target := c.followTarget(old)
+	if target == nil {
+		return
+	}
+	pctx, cancel := context.WithTimeout(ctx, minDur(c.cfg.KvrocksTimeout, time.Second))
+	defer cancel()
+	pi, err := c.deps.KV.PeerInfoReplication(pctx, target.Addr, target.Port)
+	if err != nil || pi.Role != "master" || pi.MasterOffset < 0 {
+		return
+	}
+	c.mu.Lock()
+	if c.peerSampled && pi.MasterOffset >= c.peerOffset {
+		c.peerOffset, c.peerSampled, c.peerAt = pi.MasterOffset, true, time.Now()
+	}
 	c.mu.Unlock()
 }
 
@@ -534,8 +565,23 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		}
 	}
 	epoch := elect.NextEpoch(raw)
+	// Fresh measurement: if the old leader's kvrocks still answers (only its
+	// sidecar or session went away), re-sample it now rather than trusting
+	// an older sample. Our own offset in ri is from this tick.
+	if oldMaster != nil {
+		c.resampleOld(ctx, oldMaster)
+		c.updateLag(ri)
+	}
 	c.mu.RLock()
 	lag := c.lag
+	sampleAge := time.Duration(-1)
+	if c.peerSampled && !c.peerAt.IsZero() {
+		ref := oldSeen
+		if ref.IsZero() || c.peerAt.After(ref) {
+			ref = c.peerAt
+		}
+		sampleAge = ref.Sub(c.peerAt)
+	}
 	c.mu.RUnlock()
 	// Determine old-master recency: if key empty, no old master.
 	haveOld := oldMaster != nil
@@ -547,9 +593,10 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		// the unknown-lag path requires the full hold-down — safe default.)
 		lastSeen = time.Now()
 	}
-	dec := elect.ShouldPromote(lag, c.cfg.MaxLagBytes, lastSeen, c.cfg.HoldDown, time.Now(), haveOld)
+	dec := elect.LagGate(elect.LagGateInput{Lag: lag, MaxLag: c.cfg.MaxLagBytes, SampleAge: sampleAge, MaxSampleAge: c.cfg.LagSampleMaxAge,
+		LastSeen: lastSeen, HaveOld: haveOld, HoldDown: c.cfg.HoldDown, MaxWait: c.cfg.LagGateMaxWait, Now: time.Now()})
 	if !dec.Allow {
-		c.log.Warn("promotion refused by lag gate", map[string]any{"lag": lag, "reason": dec.Reason})
+		c.log.Warn("promotion refused by lag gate", map[string]any{"lag": lag, "sample_age": sampleAge.String(), "reason": dec.Reason})
 		// Stay follower; keep replica registration, and make sure we are
 		// not a writable master while nobody holds the lock.
 		c.setRole(elect.RoleFollower)
@@ -559,7 +606,9 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		}
 		return
 	}
-	if dec.Reason != "lag within bound" {
+	if lag > c.cfg.MaxLagBytes && dec.Allow {
+		c.log.Warn("promoting despite lag", map[string]any{"lag": lag, "reason": dec.Reason})
+	} else if dec.Reason != "lag within bound" {
 		c.log.Warn("promoting with unknown lag", map[string]any{"reason": dec.Reason})
 	}
 	if ec, ok := c.deps.Lock.(consulstore.EpochCounter); ok && c.cfg.Mode != "observe" {
