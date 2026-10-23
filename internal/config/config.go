@@ -66,6 +66,13 @@ type Config struct {
 	// only accept connections from loopback addresses.
 	AdminToken     string
 	AdminTokenFile string
+	// ProxyAddr enables the TCP leader proxy (e.g. ":6380").
+	ProxyAddr string
+	// ProxyReadAddr enables the read proxy (local healthy replica).
+	ProxyReadAddr string
+	// ProxyReadFallback is "leader" or "refuse" when the local replica
+	// is not usable.
+	ProxyReadFallback string
 	// SentinelAddr enables the Sentinel-compatible listener (e.g. ":26379").
 	SentinelAddr string
 	// SentinelName is the master name clients ask for (default: cluster).
@@ -160,6 +167,9 @@ func Parse(args []string) (*Config, error) {
 	fs.Int64Var(&c.MaxLagBytes, "max-lag-bytes", getenvInt64("MAX_LAG_BYTES", 104857600), "Max replication lag bytes tolerated before refusing promotion ($MAX_LAG_BYTES)")
 	fs.DurationVar(&c.HoldDown, "hold-down", getenvDur("HOLD_DOWN", 30*time.Second), "Promote with unknown lag only if old master unreachable this long ($HOLD_DOWN)")
 
+	fs.StringVar(&c.ProxyAddr, "proxy-addr", getenv("PROXY_ADDR", ""), "Listen address for the TCP leader proxy, e.g. :6380 ($PROXY_ADDR, default: disabled)")
+	fs.StringVar(&c.ProxyReadAddr, "proxy-read-addr", getenv("PROXY_READ_ADDR", ""), "Listen address for the read proxy to the local replica, e.g. :6381 ($PROXY_READ_ADDR, default: disabled)")
+	fs.StringVar(&c.ProxyReadFallback, "proxy-read-fallback", getenv("PROXY_READ_FALLBACK", "leader"), "Read proxy when the local replica is unusable: leader or refuse ($PROXY_READ_FALLBACK)")
 	fs.StringVar(&c.SentinelAddr, "sentinel-addr", getenv("SENTINEL_ADDR", ""), "Listen address for the read-only Sentinel-compatible endpoint, e.g. :26379 ($SENTINEL_ADDR, default: disabled)")
 	fs.StringVar(&c.SentinelName, "sentinel-name", getenv("SENTINEL_NAME", ""), "Master name served on the Sentinel endpoint ($SENTINEL_NAME, default: --cluster)")
 	fs.BoolVar(&c.SentinelPrivate, "sentinel-private", getenvBool("SENTINEL_PRIVATE", false), "Announce private addresses on the Sentinel endpoint ($SENTINEL_PRIVATE)")
@@ -212,6 +222,9 @@ func Parse(args []string) (*Config, error) {
 
 	if c.AdvertiseAddr == "" {
 		c.AdvertiseAddr = c.KvrocksAddr
+	}
+	if c.ProxyReadFallback != "leader" && c.ProxyReadFallback != "refuse" {
+		return nil, fmt.Errorf("invalid --proxy-read-fallback %q (leader|refuse)", c.ProxyReadFallback)
 	}
 	if c.SentinelName == "" {
 		c.SentinelName = c.Cluster

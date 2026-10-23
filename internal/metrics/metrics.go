@@ -42,6 +42,9 @@ type Registry struct {
 	ClientKills    *prometheus.CounterVec // result=ok|error
 	ClientsKilled  prometheus.Counter
 	Handovers      *prometheus.CounterVec // result
+	ProxyActive    *prometheus.GaugeVec   // listener
+	ProxyDropped   *prometheus.CounterVec // listener
+	ProxyRefused   *prometheus.CounterVec // listener
 
 	renewAge atomic.Pointer[func() float64]
 	lockHeld atomic.Pointer[func() float64]
@@ -62,6 +65,9 @@ func New() *Registry {
 	r.ClientKills = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "client_kill_runs_total", Help: "Client-kill runs after demotion, by result."}, []string{"result"})
 	r.ClientsKilled = prometheus.NewCounter(prometheus.CounterOpts{Name: "clients_killed_total", Help: "Client connections closed after demotion."})
 	r.Handovers = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "handovers_total", Help: "Planned handover requests, by result."}, []string{"result"})
+	r.ProxyActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "proxy_active_connections", Help: "Currently proxied client connections, by listener (write|read)."}, []string{"listener"})
+	r.ProxyDropped = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "proxy_dropped_connections_total", Help: "Proxied connections closed because the routing target changed (failover, fencing, lost Consul confirmation)."}, []string{"listener"})
+	r.ProxyRefused = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "proxy_refused_connections_total", Help: "Connections refused because no safe target was known or the dial failed."}, []string{"listener"})
 
 	renew := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "consul_last_renew_age_seconds", Help: "Seconds since Consul last confirmed our session; +Inf before the first success."},
 		func() float64 { return call(&r.renewAge, math.Inf(1)) })
@@ -69,7 +75,7 @@ func New() *Registry {
 		func() float64 { return call(&r.lockHeld, 0) })
 
 	r.prom.MustRegister(r.IsLeader, r.BackendUp, r.ReplicationLag, r.Elections, r.LeaderAcquired, r.LeaderChanges,
-		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, renew, held,
+		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, r.ProxyActive, r.ProxyDropped, r.ProxyRefused, renew, held,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	r.ReplicationLag.Set(-1)

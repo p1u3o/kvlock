@@ -65,6 +65,12 @@ type Controller struct {
 	// cmds runs functions inside the control loop (planned handover).
 	cmds         chan func(context.Context)
 	handoverBusy atomic.Bool
+
+	// Proxy support: fenceGen changes on every successful fence so proxied
+	// connections are dropped even when the target address stays the same.
+	fenceGen atomic.Uint64
+	subsMu   sync.Mutex
+	subs     []chan struct{}
 }
 
 // New builds a controller.
@@ -127,6 +133,7 @@ func (c *Controller) setRole(r elect.Role) {
 	}
 	metrics.SetBool(c.reg.IsLeader, r == elect.RoleLeader)
 	c.mu.Unlock()
+	c.notify()
 }
 
 // serviceID for our registration.
@@ -668,6 +675,8 @@ func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue)
 		return false
 	}
 	c.reg.Fencing.WithLabelValues(kind, "ok").Inc()
+	c.fenceGen.Add(1)
+	c.notify()
 	_ = c.deps.KV.SetReadOnly(kctx, true)
 	c.log.Info("fenced: now a read-only replica", map[string]any{"host": host, "port": port, "leader_known": target != nil})
 	return true
@@ -767,6 +776,7 @@ func (c *Controller) watchLoop(ctx context.Context) {
 			c.leader = elect.ParseLeader(raw)
 		}
 		c.mu.Unlock()
+		c.notify()
 	}
 }
 

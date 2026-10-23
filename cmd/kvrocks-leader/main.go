@@ -16,6 +16,7 @@ import (
 	"github.com/example/kvrocks-leader/internal/kvrocks"
 	"github.com/example/kvrocks-leader/internal/logx"
 	"github.com/example/kvrocks-leader/internal/metrics"
+	"github.com/example/kvrocks-leader/internal/proxy"
 	"github.com/example/kvrocks-leader/internal/sentinel"
 )
 
@@ -76,6 +77,25 @@ func main() {
 		}()
 	}
 
+	var proxies []*proxy.Proxy
+	for _, pc := range []struct {
+		name, addr string
+		route      proxy.Route
+	}{
+		{"write", cfg.ProxyAddr, writeRoute(c)},
+		{"read", cfg.ProxyReadAddr, readRoute(c, cfg.ProxyReadFallback == "leader")},
+	} {
+		if pc.addr == "" {
+			continue
+		}
+		p, err := startProxy(pc.name, pc.addr, pc.route, c, reg, log)
+		if err != nil {
+			log.Error("proxy listener failed", map[string]any{"listener": pc.name, "error": err.Error()})
+			os.Exit(1)
+		}
+		proxies = append(proxies, p)
+	}
+
 	// SIGTERM: fast handover (deregister + release).
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -85,6 +105,9 @@ func main() {
 		sctx, scancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer scancel()
 		_ = srv.Shutdown(sctx)
+		for _, p := range proxies {
+			_ = p.Close()
+		}
 		if sent != nil {
 			_ = sent.Close()
 		}
