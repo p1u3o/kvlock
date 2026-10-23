@@ -618,7 +618,9 @@ func (c *Controller) demote(ctx context.Context, label, reason string, target *c
 	defer cancel()
 	_ = c.deps.Registrar.FailTTL(dctx, c.deps.Registrar.CheckID(c.serviceID()))
 	_ = c.deps.Registrar.Deregister(dctx, c.serviceID())
-	c.fence(ctx, c.followTarget(target))
+	if c.fence(ctx, c.followTarget(target)) {
+		c.killClients(ctx)
+	}
 	c.setRole(elect.RoleFollower)
 	c.mu.Lock()
 	c.leaderSince = time.Time{}
@@ -628,25 +630,49 @@ func (c *Controller) demote(ctx context.Context, label, reason string, target *c
 
 // fence makes the local instance refuse writes by making it a replica of
 // target, or of the configured fence address when target is nil.
-func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue) {
+func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue) bool {
 	host, port, kind := c.cfg.FenceHost, c.cfg.FencePort, "fence"
 	if target != nil {
 		host, port, kind = target.Addr, target.Port, "leader"
 	}
 	if c.cfg.Mode == "observe" {
 		c.log.Info("observe: would fence with REPLICAOF", map[string]any{"host": host, "port": port})
-		return
+		return false
 	}
 	kctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
 	defer cancel()
 	if err := c.deps.KV.ReplicaOf(kctx, host, port); err != nil {
 		c.reg.Fencing.WithLabelValues(kind, "error").Inc()
 		c.log.Error("fence REPLICAOF failed; instance may still accept writes", map[string]any{"error": err.Error(), "host": host, "port": port})
-		return
+		return false
 	}
 	c.reg.Fencing.WithLabelValues(kind, "ok").Inc()
 	_ = c.deps.KV.SetReadOnly(kctx, true)
 	c.log.Info("fenced: now a read-only replica", map[string]any{"host": host, "port": port, "leader_known": target != nil})
+	return true
+}
+
+// killClients drops normal client connections after the instance has been
+// fenced, so clients reconnect and find the new master instead of sitting
+// on a read-only replica. Replication links and our own connection are
+// never touched (see kvrocks.RedisClient.KillClients).
+func (c *Controller) killClients(ctx context.Context) {
+	if !c.cfg.KillClientsOnDemote || c.cfg.Mode == "observe" {
+		return
+	}
+	kctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+	defer cancel()
+	n, err := c.deps.KV.KillClients(kctx)
+	if n > 0 {
+		c.reg.ClientsKilled.Add(float64(n))
+	}
+	if err != nil {
+		c.reg.ClientKills.WithLabelValues("error").Inc()
+		c.log.Warn("killing client connections after demotion failed", map[string]any{"error": err.Error(), "killed": n})
+		return
+	}
+	c.reg.ClientKills.WithLabelValues("ok").Inc()
+	c.log.Info("killed client connections after demotion", map[string]any{"killed": n})
 }
 
 func (c *Controller) registerMaster(ctx context.Context) {

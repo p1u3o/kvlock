@@ -85,9 +85,17 @@ type Client interface {
 	EnsureRsIDPsync(ctx context.Context) error
 	// SetReadOnly toggles write access (best effort across flag names).
 	SetReadOnly(ctx context.Context, readonly bool) error
+	// KillClients closes normal client connections on the local instance
+	// (never replication links or the sidecar's own connection) and
+	// returns how many were closed.
+	KillClients(ctx context.Context) (int64, error)
 	// Close releases resources.
 	Close() error
 }
+
+// ClientName is set on the sidecar's own connections (CLIENT SETNAME) so
+// they can be recognised in CLIENT LIST.
+const ClientName = "kvlock-sidecar"
 
 // --- go-redis implementation ---
 
@@ -111,6 +119,10 @@ func New(addr string, port int, password string, timeout time.Duration, kind ...
 		Password:    password,
 		DialTimeout: timeout,
 		ReadTimeout: timeout,
+		ClientName:  ClientName,
+		// One connection: the sidecar's load is tiny, and it means
+		// CLIENT KILL ... SKIPME yes spares every sidecar connection.
+		PoolSize: 1,
 	})
 	k := "kvrocks"
 	if len(kind) > 0 && kind[0] != "" {
@@ -225,6 +237,76 @@ func (c *RedisClient) SetReadOnly(ctx context.Context, readonly bool) error {
 		return err
 	}
 	return nil
+}
+
+// KillClients runs CLIENT KILL TYPE normal SKIPME yes. kvrocks (2.11:
+// src/commands/cmd_server.cc, Worker::KillClient) and Redis >= 2.8.12
+// support it; TYPE normal excludes replica and master links and pub/sub
+// clients, and SKIPME yes spares the issuing connection (the sidecar's
+// only one, PoolSize 1). kvrocks defaults SKIPME to no, so it is always
+// sent explicitly. kvrocks ORs filters together, so no other filter is
+// combined with TYPE.
+//
+// If the server rejects the TYPE form, fall back to CLIENT LIST and kill
+// by ID every client that is not a replica/master/monitor link ("S"/"M"
+// flags) and not named ClientName.
+func (c *RedisClient) KillClients(ctx context.Context) (int64, error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	n, err := c.rdb.Do(ctx, "CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes").Int64()
+	if err == nil {
+		return n, nil
+	}
+	if !isUnknownCommand(err) && !strings.Contains(strings.ToLower(err.Error()), "syntax") {
+		return 0, err
+	}
+	list, lerr := c.rdb.Do(ctx, "CLIENT", "LIST").Text()
+	if lerr != nil {
+		return 0, fmt.Errorf("client kill type unsupported (%v) and client list failed: %w", err, lerr)
+	}
+	var killed int64
+	var firstErr error
+	for _, id := range KillableClientIDs(list) {
+		if e := c.rdb.Do(ctx, "CLIENT", "KILL", "ID", id).Err(); e != nil {
+			if firstErr == nil {
+				firstErr = e
+			}
+			continue
+		}
+		killed++
+	}
+	return killed, firstErr
+}
+
+// KillableClientIDs parses CLIENT LIST output and returns the IDs of
+// ordinary clients: not replicas or master links (flags S or M; on kvrocks
+// M means MONITOR, also spared), not pub/sub (sub/psub > 0 where reported)
+// and not the sidecar itself (name=ClientName).
+func KillableClientIDs(list string) []string {
+	var ids []string
+	for _, line := range strings.Split(list, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		f := map[string]string{}
+		for _, kv := range strings.Fields(line) {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				f[k] = v
+			}
+		}
+		if f["id"] == "" || f["name"] == ClientName {
+			continue
+		}
+		if strings.ContainsAny(f["flags"], "SM") {
+			continue
+		}
+		if (f["sub"] != "" && f["sub"] != "0") || (f["psub"] != "" && f["psub"] != "0") {
+			continue
+		}
+		ids = append(ids, f["id"])
+	}
+	return ids
 }
 
 func (c *RedisClient) Close() error {

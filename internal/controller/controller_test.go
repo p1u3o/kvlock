@@ -159,6 +159,9 @@ type fakeKV struct {
 	local      int64
 	peerOffset int64
 	peerErr    error
+
+	kills             int
+	killedWhileMaster bool
 }
 
 func (f *fakeKV) Ping(ctx context.Context) error {
@@ -214,6 +217,16 @@ func (f *fakeKV) SetReadOnly(ctx context.Context, ro bool) error {
 	return nil
 }
 func (f *fakeKV) Close() error { return nil }
+func (f *fakeKV) KillClients(ctx context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.kills++
+	// Killing must happen after the instance stopped accepting writes.
+	if f.role != "slave" {
+		f.killedWhileMaster = true
+	}
+	return 2, nil
+}
 
 func testConfig(node string) *config.Config {
 	return &config.Config{
@@ -225,6 +238,7 @@ func testConfig(node string) *config.Config {
 		Mode: "active", FenceHost: "127.0.0.1", FencePort: 1,
 		ReelectBaseBackoff: time.Millisecond, ReelectMaxBackoff: 5 * time.Millisecond,
 		HTTPAddr: ":0", CheckInterval: 20 * time.Millisecond,
+		KillClientsOnDemote: true,
 	}
 }
 
@@ -518,5 +532,35 @@ func TestFollowerUsesLeaderPrivateAddr(t *testing.T) {
 	fkv.mu.Unlock()
 	if host != "100.64.0.9" {
 		t.Fatalf("expected replication over private addr, got %q", host)
+	}
+}
+
+func TestDemotionKillsClientsAfterFencing(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		cfg := testConfig("kv01")
+		cfg.KillClientsOnDemote = enabled
+		kv := &fakeKV{up: true, role: "master"}
+		lock := &fakeLock{}
+		c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+		time.Sleep(80 * time.Millisecond)
+		if c.Snapshot().Role != elect.RoleLeader {
+			stop()
+			t.Fatal("precondition: leader")
+		}
+		lock.mu.Lock()
+		lock.sess = "sess-kv02"
+		lock.val = elect.MarshalLeader("kv02", "10.0.0.2", "", 6666, "sess-kv02", 9, time.Now())
+		lock.mu.Unlock()
+		time.Sleep(100 * time.Millisecond)
+		stop()
+		kv.mu.Lock()
+		kills, early := kv.kills, kv.killedWhileMaster
+		kv.mu.Unlock()
+		if enabled && (kills != 1 || early) {
+			t.Fatalf("enabled: kills=%d killedWhileMaster=%v, want exactly one kill after fencing", kills, early)
+		}
+		if !enabled && kills != 0 {
+			t.Fatalf("disabled: kills=%d, want 0", kills)
+		}
 	}
 }

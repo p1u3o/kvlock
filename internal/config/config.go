@@ -56,6 +56,10 @@ type Config struct {
 	ReelectBaseBackoff time.Duration
 	ReelectMaxBackoff  time.Duration
 
+	// KillClientsOnDemote closes normal client connections after fencing
+	// so clients reconnect and rediscover the master.
+	KillClientsOnDemote bool
+
 	HTTPAddr string
 
 	CheckInterval time.Duration
@@ -148,6 +152,8 @@ func Parse(args []string) (*Config, error) {
 	fs.DurationVar(&c.MinLeaderTime, "min-leader-time", getenvDur("MIN_LEADER_TIME", 0), "After winning, hold the lock at least this long before voluntarily handing over on local health failures; 0 disables ($MIN_LEADER_TIME)")
 	fs.DurationVar(&c.ReelectBaseBackoff, "reelect-base-backoff", getenvDur("REELECT_BASE_BACKOFF", 1*time.Second), "Base backoff between elections ($REELECT_BASE_BACKOFF)")
 	fs.DurationVar(&c.ReelectMaxBackoff, "reelect-max-backoff", getenvDur("REELECT_MAX_BACKOFF", 15*time.Second), "Max backoff between elections ($REELECT_MAX_BACKOFF)")
+
+	fs.BoolVar(&c.KillClientsOnDemote, "kill-clients-on-demote", getenvBool("KILL_CLIENTS_ON_DEMOTE", true), "After fencing a demoted master, CLIENT KILL TYPE normal so clients reconnect ($KILL_CLIENTS_ON_DEMOTE)")
 
 	fs.StringVar(&c.HTTPAddr, "http-addr", getenv("HTTP_ADDR", ":8080"), "Health/metrics listen address ($HTTP_ADDR)")
 	fs.DurationVar(&c.CheckInterval, "check-interval", getenvDur("CHECK_INTERVAL", 3*time.Second), "kvrocks health check interval ($CHECK_INTERVAL)")
