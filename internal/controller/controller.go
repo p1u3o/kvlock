@@ -734,7 +734,7 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	if !dec.Allow {
 		c.reg.LagRefusals.Inc()
 		c.event("lag_gate", fmt.Sprintf("promotion refused (%s gate, lag %s): %s", gate, fmtLag(gate, lag), dec.Reason))
-		c.log.Warn("promotion refused by lag gate", map[string]any{"gate": gate, "lag": lag, "sample_age": sampleAge.String(), "reason": dec.Reason})
+		c.log.Warn("promotion refused by lag gate", map[string]any{"gate": gate, "lag": lag, "sample_age": in.SampleAge.String(), "reason": dec.Reason})
 		// Stay follower; keep replica registration, and make sure we are
 		// not a writable master while nobody holds the lock.
 		c.setRole(elect.RoleFollower)
