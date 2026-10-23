@@ -220,9 +220,19 @@ func (c *RedisClient) EnsureRsIDPsync(ctx context.Context) error {
 		_ = v
 	}
 	if err := c.rdb.Do(ctx, "CONFIG", "SET", "use-rsid-psync", "yes").Err(); err != nil {
+		// kvrocks 2.11 no longer has this option (partial resync after a
+		// switch-over is the default there); nothing to do.
+		if isUnsupportedConfig(err) {
+			return nil
+		}
 		return err
 	}
 	return nil
+}
+
+func isUnsupportedConfig(err error) bool {
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "unsupported config") || strings.Contains(m, "unknown option") || strings.Contains(m, "not found")
 }
 
 func (c *RedisClient) SetReadOnly(ctx context.Context, readonly bool) error {

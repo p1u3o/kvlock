@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,19 +35,22 @@ type Controller struct {
 	log  *logx.Logger
 	reg  *metrics.Registry
 
-	mu             sync.RWMutex
-	role           elect.Role
-	leader         *consulstore.LeaderValue
-	lag            int64
-	kvUp           bool
-	backendRole    string // role reported by the local instance's INFO
-	sessionID      string
-	sessionValid   bool
-	unhealthy      int
-	leaderSince    time.Time
-	elections      uint64
-	leaderChanges  uint64
-	lastLeader     *consulstore.LeaderValue
+	mu            sync.RWMutex
+	role          elect.Role
+	leader        *consulstore.LeaderValue
+	lag           int64
+	kvUp          bool
+	backendRole   string // role reported by the local instance's INFO
+	sessionID     string
+	sessionValid  bool
+	unhealthy     int
+	leaderSince   time.Time
+	elections     uint64
+	leaderChanges uint64
+	lastLeader    *consulstore.LeaderValue
+	// fencePending is set when a fence attempt failed; the return watcher
+	// retries as soon as the instance answers.
+	fencePending   bool
 	lastLeaderSeen time.Time
 	// lastRenewOK is the last time Consul confirmed our session (create or
 	// renew). The leader tolerates Consul errors until ~SessionTTL past it.
@@ -154,6 +158,7 @@ func (c *Controller) Run(ctx context.Context) {
 	// Session management + health + election in one tick loop for simplicity
 	// and testability; watch loop runs separately for followers.
 	go c.watchLoop(ctx)
+	go c.backendReturnWatch(ctx)
 	ticker := time.NewTicker(c.cfg.CheckInterval)
 	defer ticker.Stop()
 	ttlTicker := time.NewTicker(c.cfg.SessionTTL / 3)
@@ -385,8 +390,16 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 		c.mu.Lock()
 		c.leader = nil
 		// The value outlives the session; it names the previous leader.
+		// If that was this node (an earlier incarnation of this sidecar),
+		// nobody newer than our own data was master, so there is no old
+		// master to wait for.
 		if lv != nil && lv.Session != sid {
-			c.lastLeader = lv
+			if lv.Node == c.cfg.NodeName {
+				c.lastLeader = nil
+				c.lastLeaderSeen = time.Time{}
+			} else {
+				c.lastLeader = lv
+			}
 		}
 		if c.lastLeader != nil && c.lastLeaderSeen.IsZero() {
 			// We never saw it holding the lock (e.g. we just started), so
@@ -550,6 +563,16 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	if dec.Reason != "lag within bound" {
 		c.log.Warn("promoting with unknown lag", map[string]any{"reason": dec.Reason})
 	}
+	if ec, ok := c.deps.Lock.(consulstore.EpochCounter); ok && c.cfg.Mode != "observe" {
+		// The counter key is never released or rewritten by anyone else,
+		// so epochs keep rising even if the leader value was lost.
+		n, err := ec.BumpEpoch(ctx, c.cfg.EpochKey(), epoch)
+		if err != nil {
+			c.log.Warn("epoch counter bump failed; using epoch from leader value", map[string]any{"error": err.Error()})
+		} else {
+			epoch = n
+		}
+	}
 	value := elect.MarshalLeader(c.cfg.NodeName, c.cfg.AdvertiseAddr, c.cfg.AdvertiseAddrPrivate, c.cfg.AdvertisePort, c.sessionIDValue(), epoch, time.Now())
 	if c.cfg.Mode == "observe" {
 		c.log.Info("observe: would acquire lock and promote", map[string]any{"epoch": epoch, "lag": lag})
@@ -617,6 +640,15 @@ func (c *Controller) followLeader(ctx context.Context, lv *consulstore.LeaderVal
 	fctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
 	defer cancel()
 	if err := c.deps.KV.ReplicaOf(fctx, lv.Addr, lv.Port); err != nil {
+		if strings.Contains(err.Error(), "own replicas") {
+			// The new leader still lists us as its replica for a moment
+			// after a switch-over. Stay fenced and retry next tick.
+			c.log.Info("new leader still lists us as its replica; will retry", map[string]any{"leader": lv.Node})
+			if ri, ierr := c.deps.KV.InfoReplication(fctx); ierr == nil && ri.Role != "slave" {
+				c.fence(ctx, nil)
+			}
+			return
+		}
 		c.log.Error("REPLICAOF leader failed", map[string]any{"error": err.Error(), "leader": lv.Node})
 		return
 	}
@@ -671,15 +703,40 @@ func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue)
 	defer cancel()
 	if err := c.deps.KV.ReplicaOf(kctx, host, port); err != nil {
 		c.reg.Fencing.WithLabelValues(kind, "error").Inc()
+		c.setFencePending()
 		c.log.Error("fence REPLICAOF failed; instance may still accept writes", map[string]any{"error": err.Error(), "host": host, "port": port})
 		return false
 	}
+	// Confirm: only a replica refuses writes.
+	if ri, err := c.deps.KV.InfoReplication(kctx); err != nil || ri.Role != "slave" {
+		role := ""
+		if ri != nil {
+			role = ri.Role
+		}
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		c.reg.Fencing.WithLabelValues(kind, "error").Inc()
+		c.setFencePending()
+		c.log.Error("fence not confirmed; instance may still accept writes", map[string]any{"error": msg, "role": role, "host": host, "port": port})
+		return false
+	}
 	c.reg.Fencing.WithLabelValues(kind, "ok").Inc()
+	c.mu.Lock()
+	c.fencePending = false
+	c.mu.Unlock()
 	c.fenceGen.Add(1)
 	c.notify()
 	_ = c.deps.KV.SetReadOnly(kctx, true)
 	c.log.Info("fenced: now a read-only replica", map[string]any{"host": host, "port": port, "leader_known": target != nil})
 	return true
+}
+
+func (c *Controller) setFencePending() {
+	c.mu.Lock()
+	c.fencePending = true
+	c.mu.Unlock()
 }
 
 // killClients drops normal client connections after the instance has been
@@ -792,8 +849,18 @@ func (c *Controller) shutdown(ctx context.Context) {
 	defer cancel()
 	_ = c.deps.Registrar.FailTTL(sctx, c.deps.Registrar.CheckID(c.serviceID()))
 	_ = c.deps.Registrar.Deregister(sctx, c.serviceID())
+	// Never leave a writable master behind: fence before the lock goes, so
+	// the next leader can never overlap with us.
+	fenced := c.fenceForShutdown(sctx)
 	if wasLeader {
 		c.reg.StepDowns.WithLabelValues(metrics.ReasonShutdown).Inc()
+		if !fenced {
+			// Releasing now could create two masters. Leave the session to
+			// expire; lock-delay then holds off the next leader a little
+			// longer, and a restarted sidecar fences on start.
+			c.log.Error("could not fence on shutdown; not releasing the lock, it will expire with the session TTL", nil)
+			return
+		}
 		c.releaseSession(sctx)
 	} else {
 		// Followers: destroy session too (harmless) and stop renewing.
@@ -804,6 +871,94 @@ func (c *Controller) shutdown(ctx context.Context) {
 			_ = c.deps.Session.Destroy(sctx, sid)
 		}
 	}
+}
+
+// fenceForShutdown makes sure the local instance is a replica before the
+// sidecar exits, retrying briefly. It reports whether the instance is now
+// confirmed fenced (or already was). Clients are dropped after fencing so
+// they reconnect to whoever is master next.
+func (c *Controller) fenceForShutdown(ctx context.Context) bool {
+	for attempt := 0; ; attempt++ {
+		pctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+		ri, err := c.deps.KV.InfoReplication(pctx)
+		cancel()
+		if err == nil && ri.Role == "slave" {
+			return true
+		}
+		if err == nil && c.fence(ctx, nil) {
+			c.killClients(ctx)
+			return true
+		}
+		if attempt >= 2 {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
+
+// backendReturnWatch polls the local instance quickly while it is down so
+// that when it comes back (restart, or after a failed fence) it is fenced
+// at once rather than on the next regular check: a restarted kvrocks
+// without a replicaof line boots as a writable master.
+func (c *Controller) backendReturnWatch(ctx context.Context) {
+	every := minDur(c.cfg.CheckInterval, 250*time.Millisecond)
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		c.mu.RLock()
+		watch := !c.kvUp || c.fencePending
+		c.mu.RUnlock()
+		if !watch {
+			continue
+		}
+		pctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+		err := c.deps.KV.Ping(pctx)
+		cancel()
+		if err != nil {
+			continue
+		}
+		done := make(chan struct{})
+		select {
+		case <-ctx.Done():
+			return
+		case c.cmds <- func(ctx context.Context) { defer close(done); c.onBackendBack(ctx) }:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+		}
+	}
+}
+
+// onBackendBack runs on the control loop when the local instance answers
+// again. A non-leader that finds it writable fences immediately, then a
+// normal tick follows.
+func (c *Controller) onBackendBack(ctx context.Context) {
+	if c.cfg.Mode != "observe" && !c.isLeader() {
+		pctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+		ri, err := c.deps.KV.InfoReplication(pctx)
+		cancel()
+		if err == nil && ri.Role != "slave" {
+			c.mu.RLock()
+			lv := c.leader
+			c.mu.RUnlock()
+			c.log.Warn("local instance is back as a writable master; fencing now", nil)
+			if c.fence(ctx, c.followTarget(lv)) {
+				c.killClients(ctx)
+			}
+		}
+	}
+	c.tick(ctx)
 }
 
 func minDur(a, b time.Duration) time.Duration {

@@ -65,12 +65,24 @@ func (e errString) Error() string { return string(e) }
 const errInvalid = errString("invalid session")
 
 type fakeLock struct {
-	mu       sync.Mutex
-	val      []byte
-	sess     string
-	idx      uint64
-	acquires int
-	getErr   error
+	mu        sync.Mutex
+	val       []byte
+	sess      string
+	idx       uint64
+	acquires  int
+	getErr    error
+	epoch     uint64 // separate counter key, as in live.BumpEpoch
+	onRelease func()
+}
+
+func (f *fakeLock) BumpEpoch(ctx context.Context, key string, min uint64) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.epoch++
+	if f.epoch < min {
+		f.epoch = min
+	}
+	return f.epoch, nil
 }
 
 func (f *fakeLock) Acquire(ctx context.Context, key, sess string, v []byte) (bool, error) {
@@ -86,6 +98,9 @@ func (f *fakeLock) Acquire(ctx context.Context, key, sess string, v []byte) (boo
 	return true, nil
 }
 func (f *fakeLock) Release(ctx context.Context, key, sess string) error {
+	if f.onRelease != nil {
+		f.onRelease()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// Like Consul's release op: drop the session, keep the value.
@@ -164,6 +179,7 @@ type fakeKV struct {
 	kills             int
 	killedWhileMaster bool
 	replicas          []kvrocks.ReplicaState
+	failReplicaOf     bool
 }
 
 func (f *fakeKV) Ping(ctx context.Context) error {
@@ -198,6 +214,9 @@ func (f *fakeKV) PeerInfoReplication(ctx context.Context, h string, p int) (*kvr
 func (f *fakeKV) ReplicaOf(ctx context.Context, h string, p int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failReplicaOf {
+		return errString("replicaof failed")
+	}
 	f.follows++
 	if p == 0 {
 		f.role = "master"

@@ -96,7 +96,7 @@ func main() {
 		proxies = append(proxies, p)
 	}
 
-	// SIGTERM: fast handover (deregister + release).
+	// SIGTERM: deregister, fence the local instance, then release the lock.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
