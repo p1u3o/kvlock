@@ -242,6 +242,9 @@ alerts by adding the prefix. Go/process collector names are unchanged.
 | `kvlock_handovers_total` | counter | `result` = ok\|aborted\|no_successor |
 | `kvlock_proxy_active_connections` | gauge | `listener` = write\|read |
 | `kvlock_proxy_dropped_connections_total`, `kvlock_proxy_refused_connections_total` | counter | `listener` |
+| `kvlock_backup_last_success_timestamp_seconds` | gauge | unix time of this node's last uploaded backup (0 = none from this node) |
+| `kvlock_backup_last_size_bytes`, `kvlock_backup_duration_seconds` | gauge | last backup on this node (encrypted size; BGSAVE + upload time) |
+| `kvlock_backup_failures_total` | counter | failed backup attempts on this node |
 
 `fence_failures_total` from v0.1 is replaced by
 `kvlock_fencing_events_total{result="error"}`.
@@ -389,6 +392,110 @@ on its own; `num-other-sentinels` is 0 and `quorum` 1.
    decommission Sentinel.
 4. **Rollback**: stop sidecars, restart Sentinel; kvrocks topology left
    behind is plain `SLAVEOF` which Sentinel understands.
+
+## Backups (S3)
+
+Optional and **off by default**. When enabled, the cluster takes an
+encrypted backup every `--backup-interval` (default 6h) and streams it to
+any S3-compatible store (AWS, Scaleway, MinIO, …).
+
+```sh
+kvrocks-leader ... \
+  --backup --backup-dir /kvrocks/backup \
+  --backup-s3-endpoint s3.fr-par.scw.cloud --backup-s3-region fr-par \
+  --backup-s3-bucket my-backups --backup-s3-prefix kvlock/ \
+  --backup-key-file /secrets/backup.key \
+  --backup-s3-access-key-file /secrets/s3-ak --backup-s3-secret-key-file /secrets/s3-sk
+```
+
+| Flag | Env | Default |
+|---|---|---|
+| `--backup` | `KVLOCK_BACKUP` | false |
+| `--backup-interval` | `KVLOCK_BACKUP_INTERVAL` | 6h (min 1m) |
+| `--backup-dir` | `KVLOCK_BACKUP_DIR` | required: kvrocks `backup-dir` as mounted in the sidecar |
+| `--backup-bgsave-timeout` | `KVLOCK_BACKUP_BGSAVE_TIMEOUT` | 30m |
+| `--backup-keep` | `KVLOCK_BACKUP_KEEP` | 0 (keep all) |
+| `--backup-allow-leader` | `KVLOCK_BACKUP_ALLOW_LEADER` | false |
+| `--backup-leader-grace` | `KVLOCK_BACKUP_LEADER_GRACE` | 1h |
+| `--backup-key-file` | `KVLOCK_BACKUP_KEY_FILE`, or the key itself in `KVLOCK_BACKUP_KEY` | required |
+| `--backup-s3-endpoint` | `KVLOCK_BACKUP_S3_ENDPOINT` | required, `host[:port]` |
+| `--backup-s3-region` | `KVLOCK_BACKUP_S3_REGION` / `AWS_REGION` | |
+| `--backup-s3-bucket` | `KVLOCK_BACKUP_S3_BUCKET` | required |
+| `--backup-s3-prefix` | `KVLOCK_BACKUP_S3_PREFIX` | `kvlock/` |
+| `--backup-s3-insecure` | `KVLOCK_BACKUP_S3_INSECURE` | false (HTTPS) |
+| `--backup-s3-sse` | `KVLOCK_BACKUP_S3_SSE` | `AES256`; `none` to not send the header |
+| `--backup-s3-access-key-file` | `KVLOCK_BACKUP_S3_ACCESS_KEY_FILE`, or `AWS_ACCESS_KEY_ID` | required |
+| `--backup-s3-secret-key-file` | `KVLOCK_BACKUP_S3_SECRET_KEY_FILE`, or `AWS_SECRET_ACCESS_KEY` | required |
+
+Generate a key with `openssl rand -hex 32` (raw 32 bytes, 64 hex chars or
+base64 are accepted). **Losing the key makes every backup unreadable.**
+
+**Who backs up.** Only a healthy follower whose instance is a linked,
+caught-up replica (the same lag bound as promotion) and that holds a
+valid Consul session. The leader backs up only with
+`--backup-allow-leader`, and then only when it has no replicas or no
+backup has succeeded for `interval + leader-grace`. Observe mode never
+runs BGSAVE or touches S3.
+
+**Single uploader.** `kvrocks/<cluster>/backup/last` holds a JSON record
+(node, object key, time, size, duration). A node only tries when that
+record is older than the interval, then acquires
+`kvrocks/<cluster>/backup/lock` with its own controller session (so the
+lock vanishes if the node dies), re-reads the record, and only then runs
+the backup. A failed attempt backs off 15m on that node, leaving room for
+the other replicas.
+
+**What is uploaded.** `BGSAVE` makes kvrocks write a RocksDB checkpoint
+into its `backup-dir`; kvlock polls `INFO persistence` until
+`bgsave_in_progress` is 0 and checks `last_bgsave_status:ok`, then streams
+`tar | gzip | encrypt` of that directory to
+`<prefix>kvlock-<cluster>-<UTC yyyymmddThhmmssZ>-<node>.tar.gz.kvlb`
+(multipart, nothing is staged on disk). The live data dir is never read.
+The sidecar needs read access to kvrocks' `backup-dir`. Keep
+`max-backup-keep-hours`/`max-backup-to-keep` such that kvrocks does not
+purge the dir mid-upload (a full sync can also purge it; the next run
+simply retries).
+
+**Retention.** `--backup-keep N` deletes all but the newest N objects of
+this cluster under the prefix after each success (bucket lifecycle rules
+work too).
+
+**Encryption format (KVLB1).** Client-side AES-256-GCM, streamed in chunks:
+
+```
+header : "KVLKBAK1" | chunk_size uint32 BE | nonce_prefix [7]byte   (19 bytes)
+chunk* : sealed_len uint32 BE | AES-256-GCM(chunk)                   (plaintext <= chunk_size, default 64 KiB)
+nonce  = nonce_prefix | counter uint32 BE | last_flag byte (1 on the final chunk)
+aad    = the 19-byte header
+```
+
+The final chunk (possibly empty) carries `last_flag=1`, so truncation,
+reordering, trailing data and tampering are all detected. In addition
+the upload requests SSE `AES256`. **Scaleway** rejects that header on
+some buckets; there use `--backup-s3-sse none` and enable bucket default
+encryption (SSE-ONE) instead.
+
+**Restore.**
+
+```sh
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...   # or the *-key-file flags
+kvrocks-leader restore --cluster main --list --backup-s3-endpoint ... --backup-s3-bucket ... --backup-key-file key
+kvrocks-leader restore --cluster main --target /tmp/restore [--object <key>] --backup-s3-endpoint ... --backup-s3-bucket ... --backup-key-file key
+```
+
+`restore` picks the newest backup unless `--object` is given, verifies
+and decrypts it, and unpacks into an empty or missing `--target`
+(absolute paths, `..` and links are rejected). The result is a RocksDB
+checkpoint: stop kvrocks, replace its `dir`'s `db` with it (or point a
+fresh instance's `dir` at a copy), start kvrocks, then let the cluster
+resync replicas from it. Manual decryption of a downloaded object:
+
+```sh
+kvrocks-leader backup-decrypt --backup-key-file key < obj.tar.gz.kvlb | tar -xz -C /tmp/restore
+```
+
+The status page shows a Backups card (last success, node, size, errors)
+and each start/success/failure/deletion is listed under Recent events.
 
 ## Repo layout
 

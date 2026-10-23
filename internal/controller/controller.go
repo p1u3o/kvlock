@@ -30,6 +30,8 @@ type Deps struct {
 	Lock      consulstore.Lock
 	Registrar consulstore.Registrar
 	KV        kvrocks.Client
+	// Backup is optional; nil disables backups.
+	Backup BackupRunner
 }
 
 // Controller owns runtime state.
@@ -162,6 +164,13 @@ func (c *Controller) Snapshot() httpapi.Snapshot {
 		s.LastRenewAgeSeconds = time.Since(c.lastRenewOK).Seconds()
 	}
 	s.FencePending = c.fencePending
+	if c.deps.Backup != nil {
+		bs := c.deps.Backup.Status()
+		if c.cfg.Mode == "observe" {
+			bs.Enabled = false
+		}
+		s.Backup = &bs
+	}
 	if ri := c.lastRI; ri != nil {
 		s.MasterLinkUp = ri.Role == "slave" && ri.MasterLinkUp
 		if ri.Role == "slave" {
@@ -250,6 +259,7 @@ func (c *Controller) Run(ctx context.Context) {
 	go c.backendReturnWatch(ctx)
 	if c.cfg.Mode != "observe" {
 		go c.heartbeatLoop(ctx)
+		c.startBackups(ctx)
 	}
 	ticker := time.NewTicker(c.cfg.CheckInterval)
 	defer ticker.Stop()

@@ -108,7 +108,6 @@ func (c *fakeCoord) Put(_ context.Context, key string, v []byte) error {
 	return nil
 }
 
-
 var replica = NodeState{Follower: true, Healthy: true, BackendRole: "slave", MasterLinkUp: true, LagOK: true, Session: "s-rep"}
 var leader = NodeState{Leader: true, Healthy: true, BackendRole: "master", Replicas: 1, Session: "s-lead"}
 

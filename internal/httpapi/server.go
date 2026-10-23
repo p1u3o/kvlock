@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"github.com/p1u3o/kvlock/internal/backup"
 	"net/http"
 
 	"github.com/p1u3o/kvlock/internal/elect"
@@ -10,6 +11,9 @@ import (
 
 // Snapshot is served at /status.
 type Snapshot struct {
+	// Backup is nil when backups are not configured.
+	Backup *backup.Status `json:"backup,omitempty"`
+
 	Role            elect.Role `json:"role"`
 	Leader          string     `json:"leader,omitempty"`
 	LeaderAddr      string     `json:"leader_addr,omitempty"`

@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/p1u3o/kvlock/internal/backup"
 )
 
 // Config holds all sidecar settings. Every field is settable via flag
@@ -104,6 +107,34 @@ type Config struct {
 	ShutdownHandover time.Duration
 
 	CheckInterval time.Duration
+
+	Backup Backup
+}
+
+// Backup configures the optional S3 backups. Secrets are resolved into
+// Key/AccessKey/SecretKey by Parse and never printed.
+type Backup struct {
+	Enabled       bool
+	Interval      time.Duration
+	AllowLeader   bool
+	LeaderGrace   time.Duration
+	Dir           string
+	BGSaveTimeout time.Duration
+	Keep          int
+
+	KeyFile string
+	Key     []byte // 32 bytes
+
+	Endpoint      string
+	Region        string
+	Bucket        string
+	Prefix        string
+	Insecure      bool
+	SSE           string // "AES256" or "none"
+	AccessKey     string
+	AccessKeyFile string
+	SecretKey     string
+	SecretKeyFile string
 }
 
 func getenv(key, def string) string {
@@ -215,6 +246,16 @@ func Parse(args []string) (*Config, error) {
 	fs.DurationVar(&c.ShutdownHandover, "shutdown-handover-timeout", getenvDur("SHUTDOWN_HANDOVER_TIMEOUT", 5*time.Second), "On shutdown as leader, hand over to a caught-up replica within this time before fencing and releasing; 0 = off ($SHUTDOWN_HANDOVER_TIMEOUT)")
 	fs.DurationVar(&c.CheckInterval, "check-interval", getenvDur("CHECK_INTERVAL", 3*time.Second), "kvrocks health check interval ($CHECK_INTERVAL)")
 
+	b := &c.Backup
+	fs.BoolVar(&b.Enabled, "backup", getenvBool("KVLOCK_BACKUP", false), "Enable encrypted S3 backups from a healthy replica ($KVLOCK_BACKUP)")
+	fs.DurationVar(&b.Interval, "backup-interval", getenvDur("KVLOCK_BACKUP_INTERVAL", 6*time.Hour), "Time between cluster backups ($KVLOCK_BACKUP_INTERVAL)")
+	fs.BoolVar(&b.AllowLeader, "backup-allow-leader", getenvBool("KVLOCK_BACKUP_ALLOW_LEADER", false), "Let the leader back up when it has no replica or replicas missed --backup-interval + --backup-leader-grace ($KVLOCK_BACKUP_ALLOW_LEADER)")
+	fs.DurationVar(&b.LeaderGrace, "backup-leader-grace", getenvDur("KVLOCK_BACKUP_LEADER_GRACE", time.Hour), "Extra time the leader waits for a replica backup ($KVLOCK_BACKUP_LEADER_GRACE)")
+	fs.StringVar(&b.Dir, "backup-dir", getenv("KVLOCK_BACKUP_DIR", ""), "kvrocks backup-dir (where BGSAVE writes its checkpoint) as mounted in this container ($KVLOCK_BACKUP_DIR)")
+	fs.DurationVar(&b.BGSaveTimeout, "backup-bgsave-timeout", getenvDur("KVLOCK_BACKUP_BGSAVE_TIMEOUT", 30*time.Minute), "Max wait for BGSAVE to finish ($KVLOCK_BACKUP_BGSAVE_TIMEOUT)")
+	fs.IntVar(&b.Keep, "backup-keep", getenvInt("KVLOCK_BACKUP_KEEP", 0), "Keep only the newest N backups of this cluster; 0 = keep all ($KVLOCK_BACKUP_KEEP)")
+	b.RegisterStoreFlags(fs)
+
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -304,6 +345,11 @@ func Parse(args []string) (*Config, error) {
 	if c.SessionTTL < 5*time.Second {
 		return nil, fmt.Errorf("session TTL %v too short: minimum 5s", c.SessionTTL)
 	}
+	if c.Backup.Enabled {
+		if err := c.Backup.resolve(); err != nil {
+			return nil, err
+		}
+	}
 	return c, nil
 }
 
@@ -338,4 +384,99 @@ func bytesTrim(b []byte) []byte {
 		i++
 	}
 	return b[i:n]
+}
+
+// resolve validates the backup settings and loads secrets. It is also
+// used by the restore subcommand (which does not need Dir).
+func (b *Backup) resolve() error {
+	if err := b.ResolveStore(); err != nil {
+		return err
+	}
+	if b.Dir == "" {
+		return fmt.Errorf("--backup-dir is required with --backup")
+	}
+	if b.Interval < time.Minute {
+		return fmt.Errorf("--backup-interval %v too short: minimum 1m", b.Interval)
+	}
+	if b.Keep < 0 || b.LeaderGrace < 0 || b.BGSaveTimeout <= 0 {
+		return fmt.Errorf("invalid --backup-keep/--backup-leader-grace/--backup-bgsave-timeout")
+	}
+	return nil
+}
+
+// ResolveStore validates S3 settings and loads the encryption key and S3
+// credentials from files or the environment.
+func (b *Backup) ResolveStore() error {
+	if b.Endpoint == "" || b.Bucket == "" {
+		return fmt.Errorf("--backup-s3-endpoint and --backup-s3-bucket are required")
+	}
+	if strings.Contains(b.Endpoint, "://") {
+		return fmt.Errorf("--backup-s3-endpoint must be host[:port] without a scheme (use --backup-s3-insecure for http)")
+	}
+	switch strings.ToUpper(b.SSE) {
+	case "AES256":
+		b.SSE = "AES256"
+	case "NONE", "":
+		b.SSE = "none"
+	default:
+		return fmt.Errorf("invalid --backup-s3-sse %q: want AES256|none", b.SSE)
+	}
+	if b.Prefix != "" && !strings.HasSuffix(b.Prefix, "/") {
+		b.Prefix += "/"
+	}
+	var err error
+	if b.Key, err = secret(b.KeyFile, "KVLOCK_BACKUP_KEY", "backup key", false); err != nil {
+		return err
+	}
+	if b.Key == nil {
+		return fmt.Errorf("a backup encryption key is required (--backup-key-file or $KVLOCK_BACKUP_KEY)")
+	}
+	if b.Key, err = backup.ParseKey(b.Key); err != nil {
+		return err
+	}
+	ak, err := secret(b.AccessKeyFile, "AWS_ACCESS_KEY_ID", "S3 access key", true)
+	if err != nil {
+		return err
+	}
+	sk, err := secret(b.SecretKeyFile, "AWS_SECRET_ACCESS_KEY", "S3 secret key", true)
+	if err != nil {
+		return err
+	}
+	if len(ak) == 0 || len(sk) == 0 {
+		return fmt.Errorf("S3 credentials are required (--backup-s3-*-key-file or $AWS_ACCESS_KEY_ID/$AWS_SECRET_ACCESS_KEY)")
+	}
+	b.AccessKey, b.SecretKey = string(ak), string(sk)
+	return nil
+}
+
+// secret reads file (trimmed unless raw-capable) or falls back to env.
+func secret(file, env, what string, trim bool) ([]byte, error) {
+	if file != "" {
+		v, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("read %s file: %w", what, err)
+		}
+		if trim || len(v) != 32 {
+			v = bytesTrim(v)
+		}
+		return v, nil
+	}
+	if v := os.Getenv(env); v != "" {
+		return []byte(strings.TrimSpace(v)), nil
+	}
+	return nil, nil
+}
+
+// RegisterStoreFlags registers the S3 and encryption-key flags shared by
+// the sidecar and the restore subcommand.
+func (b *Backup) RegisterStoreFlags(fs *flag.FlagSet) {
+	fs.StringVar(&b.KeyFile, "backup-key-file", getenv("KVLOCK_BACKUP_KEY_FILE", ""), "File with the 32-byte encryption key (raw, hex or base64); or set $KVLOCK_BACKUP_KEY ($KVLOCK_BACKUP_KEY_FILE)")
+	fs.StringVar(&b.Endpoint, "backup-s3-endpoint", getenv("KVLOCK_BACKUP_S3_ENDPOINT", ""), "S3 endpoint host[:port], e.g. s3.fr-par.scw.cloud ($KVLOCK_BACKUP_S3_ENDPOINT)")
+	fs.StringVar(&b.Region, "backup-s3-region", getenv("KVLOCK_BACKUP_S3_REGION", getenv("AWS_REGION", "")), "S3 region ($KVLOCK_BACKUP_S3_REGION, $AWS_REGION)")
+	fs.StringVar(&b.Bucket, "backup-s3-bucket", getenv("KVLOCK_BACKUP_S3_BUCKET", ""), "S3 bucket ($KVLOCK_BACKUP_S3_BUCKET)")
+	fs.StringVar(&b.Prefix, "backup-s3-prefix", getenv("KVLOCK_BACKUP_S3_PREFIX", "kvlock/"), "Object key prefix ($KVLOCK_BACKUP_S3_PREFIX)")
+	fs.BoolVar(&b.Insecure, "backup-s3-insecure", getenvBool("KVLOCK_BACKUP_S3_INSECURE", false), "Use plain HTTP to the endpoint ($KVLOCK_BACKUP_S3_INSECURE)")
+	fs.StringVar(&b.SSE, "backup-s3-sse", getenv("KVLOCK_BACKUP_S3_SSE", "AES256"), "Server-side encryption to request: AES256|none ($KVLOCK_BACKUP_S3_SSE)")
+	fs.StringVar(&b.AccessKeyFile, "backup-s3-access-key-file", getenv("KVLOCK_BACKUP_S3_ACCESS_KEY_FILE", ""), "File with the S3 access key; or set $AWS_ACCESS_KEY_ID ($KVLOCK_BACKUP_S3_ACCESS_KEY_FILE)")
+	fs.StringVar(&b.SecretKeyFile, "backup-s3-secret-key-file", getenv("KVLOCK_BACKUP_S3_SECRET_KEY_FILE", ""), "File with the S3 secret key; or set $AWS_SECRET_ACCESS_KEY ($KVLOCK_BACKUP_S3_SECRET_KEY_FILE)")
 }

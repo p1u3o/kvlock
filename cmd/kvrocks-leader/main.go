@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/p1u3o/kvlock/internal/backup"
 	"net"
 	"net/http"
 	"os"
@@ -27,6 +28,12 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "handover" {
 		os.Exit(runHandover(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "restore" {
+		os.Exit(runRestore(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "backup-decrypt" {
+		os.Exit(runDecrypt(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
 	cfg, err := config.Parse(os.Args[1:])
 	if err != nil {
 		os.Stderr.WriteString("config error: " + err.Error() + "\n")
@@ -47,9 +54,24 @@ func main() {
 		lc.SetPrivate(cfg.PrivateServiceName, cfg.AdvertiseAddrPrivate)
 	}
 
-	c := controller.New(cfg, controller.Deps{
-		Session: lc, Lock: lc, Registrar: lc, KV: kv,
-	}, log, reg)
+	deps := controller.Deps{Session: lc, Lock: lc, Registrar: lc, KV: kv}
+	if cfg.Backup.Enabled && cfg.Mode != "observe" {
+		st, err := newStore(&cfg.Backup)
+		if err != nil {
+			log.Error("backup store failed", map[string]any{"error": err.Error()})
+			os.Exit(1)
+		}
+		b := cfg.Backup
+		deps.Backup = backup.NewRunner(backup.Config{
+			Cluster: cfg.Cluster, Node: cfg.NodeName, Dir: b.Dir, Prefix: b.Prefix, Key: b.Key,
+			Interval: b.Interval, Keep: b.Keep, AllowLeader: b.AllowLeader, LeaderGrace: b.LeaderGrace,
+			BGSaveTimeout: b.BGSaveTimeout,
+		}, kv, st, lc, reg, nil)
+		log.Info("backups enabled", map[string]any{"bucket": b.Bucket, "prefix": b.Prefix, "interval": b.Interval.String(), "sse": b.SSE})
+	} else if cfg.Backup.Enabled {
+		log.Warn("backups disabled in observe mode", nil)
+	}
+	c := controller.New(cfg, deps, log, reg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

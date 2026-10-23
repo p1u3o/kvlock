@@ -17,6 +17,20 @@
   }
   function yes(b) { return b ? "yes" : "no"; }
 
+  function renderBackup(b) {
+    var card = $("backup_card");
+    if (!b) { card.hidden = true; return; }
+    card.hidden = false;
+    var st = !b.enabled ? "disabled (observe)" : (b.running ? "running" : (b.last_error ? "failing" : (b.last_success ? "ok" : "no backup yet")));
+    set("bk_status", st, b.running ? "" : (b.last_error ? "err" : (b.last_success ? "ok" : "warn")));
+    var age = b.last_success ? (Date.now() - Date.parse(b.last_success)) / 1000 : -1;
+    set("bk_last", b.last_success ? b.last_success + " (" + dur(age) + " ago, every " + b.interval + ")" : "never");
+    set("bk_node", b.last_success_node);
+    set("bk_size", b.last_size_bytes ? (b.last_size_bytes / 1048576).toFixed(1) + " MiB" : "");
+    set("bk_dur", b.last_success ? dur(b.last_duration_seconds) : "");
+    set("bk_key", b.last_key);
+    set("bk_err", b.last_error, b.last_error ? "err" : "");
+  }
   function render(s) {
     set("cluster", s.cluster);
     var badge = $("badge");
@@ -37,6 +51,7 @@
     set("lag_time", s.role === "leader" ? "0 (leader)" : dur(s.lag_seconds) + " (max " + dur(s.max_lag_seconds) + ")", lagCls);
     set("lag_seq", s.lag_bytes < 0 ? "unknown" : s.lag_bytes + " (max " + s.max_lag_seq + ")");
     set("gate", s.lag_gate);
+    renderBackup(s.backup);
     set("healthy", yes(s.healthy), s.healthy ? "ok" : "err");
     set("kv_up", yes(s.kvrocks_up), s.kvrocks_up ? "ok" : "err");
     set("consul", s.consul_ok ? "ok" : "unreachable", s.consul_ok ? "ok" : "err");

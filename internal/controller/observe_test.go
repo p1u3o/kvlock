@@ -40,11 +40,13 @@ func TestObserveLeaderHasNoSideEffects(t *testing.T) {
 	cfg.ShutdownHandover = time.Second
 	kv := &fakeKV{up: true, role: "master", local: 500}
 	reg := &fakeRegistrar{}
-	c, _, _, _ := runCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: &fakeLock{}, Registrar: reg, KV: kv}, 200*time.Millisecond)
+	bp := newBackupProbe(t)
+	c, _, _, _ := runCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: &fakeLock{}, Registrar: reg, KV: kv, Backup: bp.r}, 200*time.Millisecond)
 	if c.Snapshot().Role != elect.RoleLeader {
 		t.Fatalf("expected observe leader, got %v", c.Snapshot().Role)
 	}
 	assertNoSideEffects(t, kv, reg)
+	bp.assertNone(t)
 }
 
 func TestObserveFollowerWithWrongMasterHasNoSideEffects(t *testing.T) {
@@ -55,11 +57,13 @@ func TestObserveFollowerWithWrongMasterHasNoSideEffects(t *testing.T) {
 	kv := &fakeKV{up: true, role: "master", local: 10}
 	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.9", "", 6666, "sess-x", 3, time.Now()), sess: "sess-x"}
 	reg := &fakeRegistrar{}
-	c, _, _, _ := runCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: reg, KV: kv}, 200*time.Millisecond)
+	bp := newBackupProbe(t)
+	c, _, _, _ := runCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: reg, KV: kv, Backup: bp.r}, 200*time.Millisecond)
 	if c.Snapshot().Role != elect.RoleFollower {
 		t.Fatalf("expected follower, got %v", c.Snapshot().Role)
 	}
 	assertNoSideEffects(t, kv, reg)
+	bp.assertNone(t)
 }
 
 func TestObserveReplicaOfOtherHostHasNoSideEffects(t *testing.T) {
@@ -68,8 +72,10 @@ func TestObserveReplicaOfOtherHostHasNoSideEffects(t *testing.T) {
 	kv := &fakeKV{up: true, role: "slave", masterHost: "elsewhere", masterPort: 1, lag: 5}
 	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.9", "", 6666, "sess-x", 3, time.Now()), sess: "sess-x"}
 	reg := &fakeRegistrar{}
-	runCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: reg, KV: kv}, 200*time.Millisecond)
+	bp := newBackupProbe(t)
+	runCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: reg, KV: kv, Backup: bp.r}, 200*time.Millisecond)
 	assertNoSideEffects(t, kv, reg)
+	bp.assertNone(t)
 }
 
 // A linked replica must not take a never-held lock: the master's node
