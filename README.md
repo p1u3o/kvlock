@@ -156,10 +156,8 @@ makes replicas replicate over the private address.
 Health: `GET :8080/healthz` returns 200 only when kvrocks answers, Consul
 has answered within the session TTL, and kvrocks' role matches ours
 (master while leader, replica while follower; skipped in observe mode),
-otherwise 503 with a `problems` list. Also `GET :8080/status`,
-`GET :8080/metrics` (`is_leader`, `elections_total`,
-`leader_changes_total`, `lock_held_seconds`, `kvrocks_up`,
-`replication_lag_bytes`, `fence_failures_total`).
+otherwise 503 with a `problems` list. Also `GET :8080/status` and
+`GET :8080/metrics` (see [Metrics](#metrics)).
 
 Deploy examples: `deploy/consul-policy.hcl` (per-node ACL policy) and
 `deploy/kvrocks.nomad.hcl` (one group per host; needs
@@ -167,6 +165,136 @@ Deploy examples: `deploy/consul-policy.hcl` (per-node ACL policy) and
 
 Clients find the master via Consul, e.g. `kvrocks.service.consul` with
 tag `master` (or your `--service-name`/`--master-tag`).
+
+## Metrics
+
+`GET /metrics` is a standard Prometheus endpoint (client_golang, private
+registry, plus Go/process collectors). Names are unprefixed so existing
+dashboards keep working:
+
+| metric | type | labels |
+|---|---|---|
+| `is_leader`, `kvrocks_up` | gauge | |
+| `replication_lag_bytes` | gauge (-1 = unknown) | |
+| `lock_held_seconds`, `consul_last_renew_age_seconds` | gauge | |
+| `elections_total`, `leader_acquired_total`, `leader_changes_total` | counter | |
+| `step_downs_total` | counter | `reason` = backend_unhealthy, session_invalidated, consul_unreachable, lock_lost, lock_taken, handover, shutdown |
+| `fencing_events_total` | counter | `target` = leader\|fence, `result` = ok\|error |
+| `consul_errors_total` | counter | `op` = session\|renew\|lock |
+| `client_kill_runs_total` (`result`), `clients_killed_total` | counter | |
+| `handovers_total` | counter | `result` = ok\|aborted\|no_successor |
+| `proxy_active_connections` | gauge | `listener` = write\|read |
+| `proxy_dropped_connections_total`, `proxy_refused_connections_total` | counter | `listener` |
+
+`fence_failures_total` from v0.1 is replaced by
+`fencing_events_total{result="error"}`.
+
+## Client connections on demotion
+
+After a demoted master has been fenced (REPLICAOF succeeded), the sidecar
+runs `CLIENT KILL TYPE normal SKIPME yes` so clients drop their
+connections and re-resolve the master instead of getting READONLY errors.
+kvrocks 2.11 supports `TYPE normal|pubsub|master|replica` and `SKIPME`;
+`TYPE normal` excludes replication links and pub/sub connections, and the
+sidecar's own connection (pool size 1, named `kvlock-sidecar`) is skipped.
+If the server rejects the syntax, it falls back to `CLIENT LIST` plus
+`CLIENT KILL ID` for every connection that is not a replica/master link,
+not subscribed, and not the sidecar. Disable with
+`--kill-clients-on-demote=false` (`$KILL_CLIENTS_ON_DEMOTE`). Nothing is
+killed in observe mode or if fencing failed.
+
+## Planned handover
+
+```sh
+# on the current leader (or with --addr pointing at it)
+kvrocks-leader handover [--to 10.0.0.12:6666] [--max-lag 0] [--timeout 30s]
+```
+
+or `POST /handover` with an optional JSON body
+`{"to": "ip:port", "max_lag": 0, "timeout": "30s"}`. Without
+`--admin-token`/`--admin-token-file` (`$KVLOCK_ADMIN_TOKEN[_FILE]`) the
+endpoint only accepts loopback clients; with a token it requires
+`Authorization: Bearer <token>` from anywhere. The CLI reads the same env
+vars, `--token`/`--token-file`, and `$KVLOCK_ADMIN_URL`.
+
+Steps on the leader:
+
+1. **Checks**: active mode, holding the lock, Consul session renewed within
+   TTL/2, local instance is master, and an online replica exists (the one
+   named by `--to`, as `ip:port` in the master's `INFO replication`, or the
+   least-lagged one).
+2. **Wait** until that replica's lag is within `--max-lag` (default
+   `--handover-max-lag`, which defaults to `--max-lag-bytes`), up to the
+   timeout (`--handover-timeout`, 30s). Writes continue meanwhile. Timeout
+   or any failed check aborts: nothing has changed and the node stays
+   leader (HTTP 409, CLI exit 1).
+3. **Commit**, inside the control loop: re-check, remove the master
+   registration, fence to `--fence-host` (not to the replica, to avoid a
+   replication cycle), write a hint into the lock value
+   (`handover_to`, `handover_until` = now + timeout, `handover_offset` =
+   our final offset), kill clients, release the lock. A failure before the
+   release (fence or hint write) re-promotes the local instance and keeps
+   leadership.
+4. The other sidecars see the hint: non-targets do not contend (and fence
+   themselves if writable) until it expires; the target acquires once it
+   has replicated up to `handover_offset` (exactly, for the first half of
+   the window; within `--handover-max-lag` afterwards). The old leader
+   then follows the new one as a normal replica. HTTP 200 reports the new
+   leader; 202 means the lock was released but no successor appeared
+   within the timeout, after which normal election resumes.
+
+Caveats: the hint expiry is wall-clock based, so keep node clocks in sync;
+v0.1 sidecars ignore the hint (upgrade all nodes first); there is a short
+write outage between fencing and the target's promotion (normally one
+check interval).
+
+## Leader proxy
+
+`--proxy-addr :6380` (`$PROXY_ADDR`) on every sidecar opens a plain TCP
+passthrough to the current lock holder: the local instance when this node
+is leader, otherwise the leader's private advertise address when it has
+one, else its public one. The stream is not parsed, so TLS and AUTH pass
+straight through to kvrocks (clients use the kvrocks password and TLS
+settings; certificates must be valid for the name the client connects
+to).
+
+It fails closed:
+
+- all proxied connections are closed immediately on any change of lock
+  holder, of this node's role, or when this node fences its instance;
+- new connections are refused (accepted and closed) while the leader is
+  unknown, the local leader is not yet a writable master, or Consul has not
+  answered within two check intervals (the leader's TTL grace window), and
+  existing ones are dropped when that happens.
+
+`--proxy-read-addr :6381` (`$PROXY_READ_ADDR`) routes to the local
+instance while it is a replica of a known leader within `--max-lag-bytes`;
+otherwise `--proxy-read-fallback leader` (default) sends reads to the
+leader and `refuse` refuses them.
+
+Clients should list the proxy on both nodes (`kv01:6380,kv02:6380`) or use
+the Consul name, so losing one host only costs a reconnect. Each hop adds a
+little latency; connections are long-lived, so pooling clients are fine.
+
+## Sentinel-compatible endpoint
+
+`--sentinel-addr :26379` (`$SENTINEL_ADDR`) serves a read-only subset of
+the Sentinel protocol so existing Sentinel-aware clients can keep their
+configuration during or after the cutover. The master name is
+`--sentinel-name` (default `--cluster`). Answers come from the Consul lock
+(master: the holder's public address, or private with
+`--sentinel-private`) and passing `--replica-tag` registrations
+(replicas, cached for 2s).
+
+Supported: `PING`, `SENTINEL get-master-addr-by-name|masters|master|
+replicas|slaves|sentinels|myid`, `ROLE`, `INFO`, `CLIENT SETNAME/SETINFO`,
+`QUIT`, and `SUBSCRIBE +switch-master` (published within ~0.5s of the
+holder's address changing, as `<name> <old-ip> <old-port> <new-ip>
+<new-port>`). `get-master-addr-by-name` returns nil while the lock is
+vacant. State-changing commands (`SENTINEL failover`, `set`, `monitor`,
+`reset`, …) and anything else return errors. There is no AUTH and no TLS
+on this listener; bind it to a private interface. Each sidecar answers
+on its own; `num-other-sentinels` is 0 and `quorum` 1.
 
 ## Cutover from Sentinel
 
@@ -189,5 +317,9 @@ tag `master` (or your `--service-name`/`--master-tag`).
 - `internal/consulstore` — session/lock/registrar interfaces + live impl
 - `internal/elect` — pure promotion gate, epoch, backoff (unit-tested)
 - `internal/controller` — tick/watch/demote/shutdown state machine
-- `internal/httpapi`, `internal/metrics`, `internal/logx`
+- `internal/controller/handover.go` — planned handover
+- `internal/httpapi` — /healthz /status /metrics /handover
+- `internal/proxy` — fail-closed TCP leader/read proxy
+- `internal/sentinel` + `internal/resp` — Sentinel-compatible endpoint
+- `internal/metrics`, `internal/logx`
 - `deploy/` — `consul-policy.hcl`, `kvrocks.nomad.hcl`, compose, `integration.sh`
