@@ -66,6 +66,12 @@ type Config struct {
 	// only accept connections from loopback addresses.
 	AdminToken     string
 	AdminTokenFile string
+	// SentinelAddr enables the Sentinel-compatible listener (e.g. ":26379").
+	SentinelAddr string
+	// SentinelName is the master name clients ask for (default: cluster).
+	SentinelName string
+	// SentinelPrivate announces the leader's private address when it has one.
+	SentinelPrivate bool
 	// HandoverTimeout bounds how long a planned handover waits for a
 	// replica to catch up; it is also how long the handover hint reserves
 	// the lock for the chosen replica.
@@ -154,6 +160,9 @@ func Parse(args []string) (*Config, error) {
 	fs.Int64Var(&c.MaxLagBytes, "max-lag-bytes", getenvInt64("MAX_LAG_BYTES", 104857600), "Max replication lag bytes tolerated before refusing promotion ($MAX_LAG_BYTES)")
 	fs.DurationVar(&c.HoldDown, "hold-down", getenvDur("HOLD_DOWN", 30*time.Second), "Promote with unknown lag only if old master unreachable this long ($HOLD_DOWN)")
 
+	fs.StringVar(&c.SentinelAddr, "sentinel-addr", getenv("SENTINEL_ADDR", ""), "Listen address for the read-only Sentinel-compatible endpoint, e.g. :26379 ($SENTINEL_ADDR, default: disabled)")
+	fs.StringVar(&c.SentinelName, "sentinel-name", getenv("SENTINEL_NAME", ""), "Master name served on the Sentinel endpoint ($SENTINEL_NAME, default: --cluster)")
+	fs.BoolVar(&c.SentinelPrivate, "sentinel-private", getenvBool("SENTINEL_PRIVATE", false), "Announce private addresses on the Sentinel endpoint ($SENTINEL_PRIVATE)")
 	fs.StringVar(&c.ServiceName, "service-name", getenv("SERVICE_NAME", "kvrocks"), "Consul service name ($SERVICE_NAME)")
 	fs.StringVar(&c.MasterTag, "master-tag", getenv("MASTER_TAG", "master"), "Tag for the master registration ($MASTER_TAG)")
 	fs.StringVar(&c.ReplicaTag, "replica-tag", getenv("REPLICA_TAG", "replica"), "Tag for the replica registration ($REPLICA_TAG)")
@@ -203,6 +212,9 @@ func Parse(args []string) (*Config, error) {
 
 	if c.AdvertiseAddr == "" {
 		c.AdvertiseAddr = c.KvrocksAddr
+	}
+	if c.SentinelName == "" {
+		c.SentinelName = c.Cluster
 	}
 	if c.AdvertiseAddrPrivate != "" && c.PrivateServiceName == "" {
 		c.PrivateServiceName = c.ServiceName + "-private"

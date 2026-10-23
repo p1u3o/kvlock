@@ -107,6 +107,17 @@ func (c *Controller) Snapshot() httpapi.Snapshot {
 
 func (c *Controller) Metrics() *metrics.Registry { return c.reg }
 
+// CurrentLeader returns a copy of the lock holder's value as last seen, or
+// false while the lock is vacant or unknown.
+func (c *Controller) CurrentLeader() (consulstore.LeaderValue, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.leader == nil {
+		return consulstore.LeaderValue{}, false
+	}
+	return *c.leader, true
+}
+
 func (c *Controller) setRole(r elect.Role) {
 	c.mu.Lock()
 	if c.role != r {

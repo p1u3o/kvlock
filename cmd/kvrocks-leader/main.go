@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	"github.com/example/kvrocks-leader/internal/kvrocks"
 	"github.com/example/kvrocks-leader/internal/logx"
 	"github.com/example/kvrocks-leader/internal/metrics"
+	"github.com/example/kvrocks-leader/internal/sentinel"
 )
 
 func main() {
@@ -58,6 +60,22 @@ func main() {
 		}
 	}()
 
+	var sent *sentinel.Server
+	if cfg.SentinelAddr != "" {
+		ln, err := net.Listen("tcp", cfg.SentinelAddr)
+		if err != nil {
+			log.Error("sentinel listener failed", map[string]any{"error": err.Error()})
+			os.Exit(1)
+		}
+		sent = sentinel.New(cfg.SentinelName, &sentinelSource{cfg: cfg, ctl: c, cat: lc}, 500*time.Millisecond, log.Info)
+		go func() {
+			log.Info("sentinel endpoint listening", map[string]any{"addr": cfg.SentinelAddr, "name": cfg.SentinelName})
+			if err := sent.Serve(ln); err != nil {
+				log.Error("sentinel endpoint failed", map[string]any{"error": err.Error()})
+			}
+		}()
+	}
+
 	// SIGTERM: fast handover (deregister + release).
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -67,6 +85,9 @@ func main() {
 		sctx, scancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer scancel()
 		_ = srv.Shutdown(sctx)
+		if sent != nil {
+			_ = sent.Close()
+		}
 		cancel()
 	}()
 

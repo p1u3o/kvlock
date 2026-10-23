@@ -242,3 +242,31 @@ func (l *Client) Deregister(ctx context.Context, serviceID string) error {
 }
 
 func (l *Client) CheckID(serviceID string) string { return "service:" + serviceID }
+
+// Instance is a healthy catalog entry.
+type Instance struct {
+	Node string
+	Addr string
+	Port int
+}
+
+// HealthyInstances lists passing instances of service carrying tag.
+func (l *Client) HealthyInstances(ctx context.Context, service, tag string) ([]Instance, error) {
+	entries, _, err := l.c.Health().Service(service, tag, true, (&consul.QueryOptions{}).WithContext(ctx))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Instance, 0, len(entries))
+	for _, e := range entries {
+		addr := e.Service.Address
+		if addr == "" && e.Node != nil {
+			addr = e.Node.Address
+		}
+		node := ""
+		if e.Node != nil {
+			node = e.Node.Node
+		}
+		out = append(out, Instance{Node: node, Addr: addr, Port: e.Service.Port})
+	}
+	return out, nil
+}
