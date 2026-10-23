@@ -4,6 +4,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -64,11 +65,22 @@ type Controller struct {
 // New builds a controller.
 func New(cfg *config.Config, deps Deps, log *logx.Logger, reg *metrics.Registry) *Controller {
 	c := &Controller{cfg: cfg, deps: deps, log: log, reg: reg, role: elect.RoleUnknown, lag: -1, peerOffset: -1, rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
-	// Stable exposition from boot.
-	reg.SetGauge("is_leader", 0)
-	reg.SetGauge("kvrocks_up", 0)
-	reg.SetGauge("replication_lag_bytes", -1)
-	reg.SetGaugeFloat("lock_held_seconds", 0)
+	reg.SetRenewAgeFunc(func() float64 {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		if c.lastRenewOK.IsZero() {
+			return math.Inf(1)
+		}
+		return time.Since(c.lastRenewOK).Seconds()
+	})
+	reg.SetLockHeldFunc(func() float64 {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		if c.role != elect.RoleLeader || c.leaderSince.IsZero() {
+			return 0
+		}
+		return time.Since(c.leaderSince).Seconds()
+	})
 	return c
 }
 
@@ -95,13 +107,9 @@ func (c *Controller) setRole(r elect.Role) {
 	if c.role != r {
 		c.role = r
 		c.leaderChanges++
-		c.reg.Inc("leader_changes_total")
+		c.reg.LeaderChanges.Inc()
 	}
-	if r == elect.RoleLeader {
-		c.reg.SetGauge("is_leader", 1)
-	} else {
-		c.reg.SetGauge("is_leader", 0)
-	}
+	metrics.SetBool(c.reg.IsLeader, r == elect.RoleLeader)
 	c.mu.Unlock()
 }
 
@@ -159,6 +167,7 @@ func (c *Controller) ensureSession(ctx context.Context) {
 	// (Re)create only while kvrocks healthy; checked in tick, but also gate here.
 	id, err := c.deps.Session.Create(ctx, c.cfg.SessionTTL, c.cfg.LockDelay)
 	if err != nil {
+		c.reg.ConsulErrors.WithLabelValues("session").Inc()
 		c.log.Warn("session create failed", map[string]any{"error": err.Error()})
 		return
 	}
@@ -202,11 +211,11 @@ func (c *Controller) renewSession(ctx context.Context) {
 			c.lastConsulOK = time.Now()
 			c.mu.Unlock()
 			if c.isLeader() {
-				c.demote(ctx, "session invalidated", nil)
+				c.demote(ctx, metrics.ReasonSessionInvalidated, "session invalidated", nil)
 			}
 			return
 		}
-		c.onConsulError(ctx, err)
+		c.onConsulError(ctx, "renew", err)
 		return
 	}
 	now := time.Now()
@@ -252,7 +261,7 @@ func (c *Controller) tick(ctx context.Context) {
 	}
 	unhealthy := c.unhealthy
 	c.mu.Unlock()
-	c.reg.SetGauge("kvrocks_up", boolToInt(c.Snapshot().KvrocksUp))
+	metrics.SetBool(c.reg.BackendUp, perr == nil)
 
 	if perr != nil {
 		c.log.Warn("kvrocks unhealthy", map[string]any{"streak": unhealthy, "error": perr.Error()})
@@ -262,7 +271,7 @@ func (c *Controller) tick(ctx context.Context) {
 			// Stop renewing (renewSession gates on kvUp next round) and
 			// proactively release + demote if leader.
 			if c.isLeader() {
-				c.demote(ctx, "kvrocks unhealthy", nil)
+				c.demote(ctx, metrics.ReasonBackendUnhealthy, "kvrocks unhealthy", nil)
 				c.releaseSession(ctx)
 			} else {
 				c.releaseSession(ctx)
@@ -287,14 +296,14 @@ func (c *Controller) tick(ctx context.Context) {
 	// on the same node has a different session.
 	raw, holder, _, err := c.deps.Lock.Get(ctx, c.cfg.LeaderKey())
 	if err != nil {
-		c.onConsulError(ctx, err)
+		c.onConsulError(ctx, "lock", err)
 		return
 	}
 	c.mu.Lock()
 	c.lastConsulOK = time.Now()
 	c.mu.Unlock()
 	c.evaluate(ctx, ri, raw, holder, sid)
-	c.reg.SetGauge("replication_lag_bytes", c.Snapshot().LagBytes)
+	c.reg.ReplicationLag.Set(float64(c.Snapshot().LagBytes))
 }
 
 // sampleLeader records the leader's replication offset so the lag gate has
@@ -363,7 +372,7 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 		seen := c.lastLeaderSeen
 		c.mu.Unlock()
 		if c.isLeader() {
-			c.demote(ctx, "lock no longer held", nil)
+			c.demote(ctx, metrics.ReasonLockLost, "lock no longer held", nil)
 		}
 		// Keep the last sample from the departed leader: that is exactly
 		// what the lag gate needs now.
@@ -395,7 +404,8 @@ func (c *Controller) probe(ctx context.Context) (*kvrocks.ReplicationInfo, error
 // elapses without a renew, so the leader keeps serving until roughly one
 // TTL has passed since the last successful renewal, then steps down
 // (before the server-side release lets the other node take over).
-func (c *Controller) onConsulError(ctx context.Context, err error) {
+func (c *Controller) onConsulError(ctx context.Context, op string, err error) {
+	c.reg.ConsulErrors.WithLabelValues(op).Inc()
 	c.mu.RLock()
 	last := c.lastRenewOK
 	c.mu.RUnlock()
@@ -405,7 +415,7 @@ func (c *Controller) onConsulError(ctx context.Context, err error) {
 		return
 	}
 	if elect.ConsulOutageExceeded(last, time.Now(), c.cfg.SessionTTL) {
-		c.demote(ctx, "consul unreachable for ~session TTL", nil)
+		c.demote(ctx, metrics.ReasonConsulUnreachable, "consul unreachable for ~session TTL", nil)
 	}
 }
 
@@ -415,9 +425,7 @@ func (c *Controller) onSelfLeader(ctx context.Context, ri *kvrocks.ReplicationIn
 	if c.leaderSince.IsZero() {
 		c.leaderSince = time.Now()
 	}
-	since := c.leaderSince
 	c.mu.Unlock()
-	c.reg.SetGaugeFloat("lock_held_seconds", time.Since(since).Seconds())
 	// Keep master registration TTL fresh.
 	c.passCheck(ctx)
 	// Ensure still promoted (idempotent).
@@ -430,10 +438,9 @@ func (c *Controller) onFollow(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 	target := c.followTarget(lv)
 	if c.isLeader() {
 		// Lost the lock to another session.
-		c.demote(ctx, "lock held by another session", lv)
+		c.demote(ctx, metrics.ReasonLockTaken, "lock held by another session", lv)
 	}
 	c.setRole(elect.RoleFollower)
-	c.reg.SetGauge("is_leader", 0)
 	c.registerReplica(ctx)
 	c.passCheck(ctx)
 	if target == nil {
@@ -521,7 +528,7 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		c.mu.Lock()
 		c.elections++
 		c.mu.Unlock()
-		c.reg.Inc("elections_total")
+		c.reg.Elections.Inc()
 		return
 	}
 	c.mu.Lock()
@@ -531,7 +538,7 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	c.mu.Lock()
 	c.elections++
 	c.mu.Unlock()
-	c.reg.Inc("elections_total")
+	c.reg.Elections.Inc()
 	if err != nil {
 		c.log.Warn("acquire failed", map[string]any{"error": err.Error()})
 		return
@@ -550,6 +557,7 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	c.leaderSince = time.Now()
 	c.mu.Unlock()
 	c.setRole(elect.RoleLeader)
+	c.reg.LeaderAcquired.Inc()
 	c.log.Info("became leader", map[string]any{"epoch": epoch})
 }
 
@@ -598,7 +606,8 @@ func (c *Controller) followLeader(ctx context.Context, lv *consulstore.LeaderVal
 // deliberately unreachable fence address otherwise; either way the
 // instance becomes a read-only replica and keeps its data until it can
 // sync from a real leader.
-func (c *Controller) demote(ctx context.Context, reason string, target *consulstore.LeaderValue) {
+func (c *Controller) demote(ctx context.Context, label, reason string, target *consulstore.LeaderValue) {
+	c.reg.StepDowns.WithLabelValues(label).Inc()
 	c.log.Warn("demoting", map[string]any{"reason": reason})
 	if c.cfg.Mode == "observe" {
 		c.log.Info("observe: would demote (remove master registration, REPLICAOF leader or fence target)", nil)
@@ -620,9 +629,9 @@ func (c *Controller) demote(ctx context.Context, reason string, target *consulst
 // fence makes the local instance refuse writes by making it a replica of
 // target, or of the configured fence address when target is nil.
 func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue) {
-	host, port := c.cfg.FenceHost, c.cfg.FencePort
+	host, port, kind := c.cfg.FenceHost, c.cfg.FencePort, "fence"
 	if target != nil {
-		host, port = target.Addr, target.Port
+		host, port, kind = target.Addr, target.Port, "leader"
 	}
 	if c.cfg.Mode == "observe" {
 		c.log.Info("observe: would fence with REPLICAOF", map[string]any{"host": host, "port": port})
@@ -631,10 +640,11 @@ func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue)
 	kctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
 	defer cancel()
 	if err := c.deps.KV.ReplicaOf(kctx, host, port); err != nil {
-		c.reg.Inc("fence_failures_total")
+		c.reg.Fencing.WithLabelValues(kind, "error").Inc()
 		c.log.Error("fence REPLICAOF failed; instance may still accept writes", map[string]any{"error": err.Error(), "host": host, "port": port})
 		return
 	}
+	c.reg.Fencing.WithLabelValues(kind, "ok").Inc()
 	_ = c.deps.KV.SetReadOnly(kctx, true)
 	c.log.Info("fenced: now a read-only replica", map[string]any{"host": host, "port": port, "leader_known": target != nil})
 }
@@ -726,6 +736,7 @@ func (c *Controller) shutdown(ctx context.Context) {
 	_ = c.deps.Registrar.FailTTL(sctx, c.deps.Registrar.CheckID(c.serviceID()))
 	_ = c.deps.Registrar.Deregister(sctx, c.serviceID())
 	if wasLeader {
+		c.reg.StepDowns.WithLabelValues(metrics.ReasonShutdown).Inc()
 		c.releaseSession(sctx)
 	} else {
 		// Followers: destroy session too (harmless) and stop renewing.
@@ -736,13 +747,6 @@ func (c *Controller) shutdown(ctx context.Context) {
 			_ = c.deps.Session.Destroy(sctx, sid)
 		}
 	}
-}
-
-func boolToInt(b bool) int64 {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 func minDur(a, b time.Duration) time.Duration {

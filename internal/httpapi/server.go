@@ -46,9 +46,6 @@ func Handler(p Provider) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(p.Snapshot())
 	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		_, _ = w.Write([]byte(p.Metrics().Render()))
-	})
+	mux.Handle("/metrics", p.Metrics().Handler())
 	return mux
 }

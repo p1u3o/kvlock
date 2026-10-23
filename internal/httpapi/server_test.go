@@ -25,7 +25,7 @@ func (s stub) Metrics() *metrics.Registry { return s.reg }
 
 func TestEndpoints(t *testing.T) {
 	p := stub{reg: metrics.New()}
-	p.reg.SetGauge("is_leader", 1)
+	p.reg.IsLeader.Set(1)
 	srv := httptest.NewServer(httpapi.Handler(p))
 	defer srv.Close()
 

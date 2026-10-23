@@ -1,91 +1,117 @@
+// Package metrics holds the sidecar's Prometheus metrics.
+//
+// Metric names are kept unprefixed (is_leader, elections_total, ...) so
+// existing scrapes and dashboards keep working.
 package metrics
 
 import (
-	"fmt"
-	"sort"
-	"sync"
+	"math"
+	"net/http"
 	"sync/atomic"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Registry is a tiny Prometheus exposition without external deps.
+// Step-down reasons used as the "reason" label of step_downs_total.
+const (
+	ReasonBackendUnhealthy   = "backend_unhealthy"
+	ReasonSessionInvalidated = "session_invalidated"
+	ReasonConsulUnreachable  = "consul_unreachable"
+	ReasonLockLost           = "lock_lost"
+	ReasonLockTaken          = "lock_taken"
+	ReasonHandover           = "handover"
+	ReasonShutdown           = "shutdown"
+)
+
+// Registry owns a private Prometheus registry and the sidecar's metrics.
 type Registry struct {
-	mu       sync.Mutex
-	gauges   map[string]*int64Box
-	counters map[string]*int64Box
+	prom *prometheus.Registry
+
+	IsLeader       prometheus.Gauge
+	BackendUp      prometheus.Gauge
+	ReplicationLag prometheus.Gauge
+
+	Elections      prometheus.Counter
+	LeaderAcquired prometheus.Counter
+	LeaderChanges  prometheus.Counter
+	StepDowns      *prometheus.CounterVec // reason
+	Fencing        *prometheus.CounterVec // target=leader|fence, result=ok|error
+	ConsulErrors   *prometheus.CounterVec // op
+	ClientKills    *prometheus.CounterVec // result=ok|error
+	ClientsKilled  prometheus.Counter
+	Handovers      *prometheus.CounterVec // result
+
+	renewAge atomic.Pointer[func() float64]
+	lockHeld atomic.Pointer[func() float64]
 }
 
-type int64Box struct{ v atomic.Int64 }
-
+// New builds a Registry with every metric registered and zero-initialised.
 func New() *Registry {
-	return &Registry{gauges: map[string]*int64Box{}, counters: map[string]*int64Box{}}
+	r := &Registry{prom: prometheus.NewRegistry()}
+	r.IsLeader = prometheus.NewGauge(prometheus.GaugeOpts{Name: "is_leader", Help: "1 while this sidecar holds the leader lock."})
+	r.BackendUp = prometheus.NewGauge(prometheus.GaugeOpts{Name: "kvrocks_up", Help: "1 while the local backend answers PING and INFO."})
+	r.ReplicationLag = prometheus.NewGauge(prometheus.GaugeOpts{Name: "replication_lag_bytes", Help: "Lag behind the leader (kvrocks: sequence numbers, Redis: bytes); -1 unknown, 0 on the leader."})
+	r.Elections = prometheus.NewCounter(prometheus.CounterOpts{Name: "elections_total", Help: "Lock acquisition attempts."})
+	r.LeaderAcquired = prometheus.NewCounter(prometheus.CounterOpts{Name: "leader_acquired_total", Help: "Times this node won the lock (failovers/handovers onto this node)."})
+	r.LeaderChanges = prometheus.NewCounter(prometheus.CounterOpts{Name: "leader_changes_total", Help: "Local role transitions."})
+	r.StepDowns = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "step_downs_total", Help: "Times this node stopped being leader, by reason."}, []string{"reason"})
+	r.Fencing = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "fencing_events_total", Help: "REPLICAOF fencing attempts, by target kind and result."}, []string{"target", "result"})
+	r.ConsulErrors = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "consul_errors_total", Help: "Failed Consul calls, by operation."}, []string{"op"})
+	r.ClientKills = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "client_kill_runs_total", Help: "Client-kill runs after demotion, by result."}, []string{"result"})
+	r.ClientsKilled = prometheus.NewCounter(prometheus.CounterOpts{Name: "clients_killed_total", Help: "Client connections closed after demotion."})
+	r.Handovers = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "handovers_total", Help: "Planned handover requests, by result."}, []string{"result"})
+
+	renew := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "consul_last_renew_age_seconds", Help: "Seconds since Consul last confirmed our session; +Inf before the first success."},
+		func() float64 { return call(&r.renewAge, math.Inf(1)) })
+	held := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "lock_held_seconds", Help: "Seconds this node has held the leader lock; 0 when not leader."},
+		func() float64 { return call(&r.lockHeld, 0) })
+
+	r.prom.MustRegister(r.IsLeader, r.BackendUp, r.ReplicationLag, r.Elections, r.LeaderAcquired, r.LeaderChanges,
+		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, renew, held,
+		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+
+	r.ReplicationLag.Set(-1)
+	for _, reason := range []string{ReasonBackendUnhealthy, ReasonSessionInvalidated, ReasonConsulUnreachable, ReasonLockLost, ReasonLockTaken, ReasonHandover, ReasonShutdown} {
+		r.StepDowns.WithLabelValues(reason)
+	}
+	for _, t := range []string{"leader", "fence"} {
+		r.Fencing.WithLabelValues(t, "ok")
+		r.Fencing.WithLabelValues(t, "error")
+	}
+	for _, op := range []string{"session", "renew", "lock"} {
+		r.ConsulErrors.WithLabelValues(op)
+	}
+	return r
 }
 
-func (r *Registry) gauge(name string) *int64Box {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	b, ok := r.gauges[name]
-	if !ok {
-		b = &int64Box{}
-		r.gauges[name] = b
+func call(p *atomic.Pointer[func() float64], def float64) float64 {
+	if f := p.Load(); f != nil {
+		return (*f)()
 	}
-	return b
+	return def
 }
 
-func (r *Registry) counter(name string) *int64Box {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	b, ok := r.counters[name]
-	if !ok {
-		b = &int64Box{}
-		r.counters[name] = b
+// SetRenewAgeFunc sets the source of consul_last_renew_age_seconds.
+func (r *Registry) SetRenewAgeFunc(f func() float64) { r.renewAge.Store(&f) }
+
+// SetLockHeldFunc sets the source of lock_held_seconds.
+func (r *Registry) SetLockHeldFunc(f func() float64) { r.lockHeld.Store(&f) }
+
+// SetBool sets a gauge to 1 or 0.
+func SetBool(g prometheus.Gauge, b bool) {
+	if b {
+		g.Set(1)
+	} else {
+		g.Set(0)
 	}
-	return b
 }
 
-func (r *Registry) SetGauge(name string, v int64)        { r.gauge(name).v.Store(v) }
-func (r *Registry) SetGaugeFloat(name string, v float64) { r.gauge(name).v.Store(int64(v * 1000)) }
-func (r *Registry) Inc(name string)                      { r.counter(name).v.Add(1) }
-func (r *Registry) Add(name string, d int64)             { r.counter(name).v.Add(d) }
-
-// Float gauges are rendered /1000; document in help text.
-var floatGauges = map[string]bool{"lock_held_seconds": true}
-
-// Render writes Prometheus text exposition.
-func (r *Registry) Render() string {
-	r.mu.Lock()
-	names := func(m map[string]*int64Box) []string {
-		out := make([]string, 0, len(m))
-		for k := range m {
-			out = append(out, k)
-		}
-		sort.Strings(out)
-		return out
-	}
-	gNames, cNames := names(r.gauges), names(r.counters)
-	type pair struct {
-		k string
-		v int64
-	}
-	gs := make([]pair, 0, len(gNames))
-	for _, k := range gNames {
-		gs = append(gs, pair{k, r.gauges[k].v.Load()})
-	}
-	cs := make([]pair, 0, len(cNames))
-	for _, k := range cNames {
-		cs = append(cs, pair{k, r.counters[k].v.Load()})
-	}
-	r.mu.Unlock()
-
-	out := ""
-	for _, p := range gs {
-		if floatGauges[p.k] {
-			out += fmt.Sprintf("# TYPE %s gauge\n%s %0.3f\n", p.k, p.k, float64(p.v)/1000.0)
-		} else {
-			out += fmt.Sprintf("# TYPE %s gauge\n%s %d\n", p.k, p.k, p.v)
-		}
-	}
-	for _, p := range cs {
-		out += fmt.Sprintf("# TYPE %s counter\n%s %d\n", p.k, p.k, p.v)
-	}
-	return out
+// Handler serves the registry in Prometheus exposition format.
+func (r *Registry) Handler() http.Handler {
+	return promhttp.HandlerFor(r.prom, promhttp.HandlerOpts{})
 }
+
+// Gatherer exposes the underlying registry (tests).
+func (r *Registry) Gatherer() prometheus.Gatherer { return r.prom }

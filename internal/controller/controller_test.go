@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/example/kvrocks-leader/internal/config"
 	"github.com/example/kvrocks-leader/internal/controller"
 	"github.com/example/kvrocks-leader/internal/elect"
@@ -396,6 +398,19 @@ func TestDemoteFencesByReplicatingNewLeader(t *testing.T) {
 	role, host, port := kv.state()
 	if role != "slave" || host != "10.0.0.2" || port != 6666 {
 		t.Fatalf("old master must become replica of new leader, got role=%s %s:%d", role, host, port)
+	}
+	m := c.Metrics()
+	if got := testutil.ToFloat64(m.StepDowns.WithLabelValues(metrics.ReasonLockTaken)); got != 1 {
+		t.Fatalf("step_downs_total{reason=lock_taken} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.Fencing.WithLabelValues("leader", "ok")); got < 1 {
+		t.Fatalf("fencing_events_total{target=leader,result=ok} = %v, want >= 1", got)
+	}
+	if got := testutil.ToFloat64(m.IsLeader); got != 0 {
+		t.Fatalf("is_leader = %v after demotion", got)
+	}
+	if got := testutil.ToFloat64(m.LeaderAcquired); got != 1 {
+		t.Fatalf("leader_acquired_total = %v, want 1", got)
 	}
 }
 
