@@ -12,29 +12,49 @@ Each sidecar runs next to its local kvrocks and loops every
    `--kvrocks-timeout`, default 2s). After `--unhealthy-threshold`
    (default 3) consecutive failures the sidecar stops renewing its Consul
    session and releases the lock.
-2. **Session**: Consul session, TTL `--session-ttl` (default 10s),
-   `behavior=release`, `LockDelay` `--lock-delay` (default 1s; Consul's
-   15s default is far too slow for failover). Renewed at TTL/3, only
-   while kvrocks is healthy.
+2. **Session**: Consul session with **no node health checks** (only the
+   TTL), TTL `--session-ttl` (default 10s), `behavior=release`,
+   `LockDelay` `--lock-delay` (default 1s). Renewed at TTL/3 while kvrocks
+   is healthy. A flapping Consul agent/serf check therefore cannot destroy
+   the session; only TTL expiry, explicit release, or invalidation can.
 3. **Election**: atomic acquire of `kvrocks/<cluster>/leader` with JSON
-   `{node, addr, port, session, since, epoch}`. `epoch` increments on
+   `{node, addr, private_addr, port, session, since, epoch}`. **Leadership
+   is decided by the session that holds the key**, never by the node name
+   in the value: a key whose value names us but which is held by no session
+   (or another session) does not make us leader. `epoch` increments on
    every new leader.
-4. **Leader**: `REPLICAOF NO ONE` (fallback `SLAVEOF NO ONE` for
-   kvrocks < 2.11), best-effort writable + `use-rsid-psync yes`, registers
-   Consul service `--service-name` (default `kvrocks`) tagged
-   `--master-tag`, with a TTL check the sidecar refreshes (TTL =
-   session TTL). Failover never waits on Nomad check intervals.
+4. **Leader**: `REPLICAOF NO ONE` (fallback `SLAVEOF NO ONE`), best-effort
+   writable + `use-rsid-psync yes`, registers Consul service
+   `--service-name` tagged `--master-tag` with a TTL check the sidecar
+   refreshes.
 5. **Follower**: blocking-query watch on the leader key, registers the
    same service tagged `--replica-tag`, issues `REPLICAOF host port` only
-   when not already following that host:port.
-6. **Demote first**: on session invalidation, sustained unhealthiness, or
-   Consul unreachable longer than ~TTL, the leader fails its TTL check +
-   deregisters the master service and sets read-only *before* releasing the
-   lock. An isolated old master therefore stops advertising within ~1 TTL.
-7. **Shutdown**: SIGTERM removes the master registration and releases the
+   when not already following that host:port (the leader's private address
+   when it published one). Each tick it also samples the leader's
+   `master_repl_offset` for the lag gate (below).
+6. **Demote + fence**: on session invalidation, losing the lock, sustained
+   unhealthiness, or Consul unreachable for longer than the session TTL
+   since the last successful renew, the leader fails its TTL check,
+   deregisters the master service, and **fences** its local instance:
+   `REPLICAOF <new leader>` if one is known, otherwise
+   `REPLICAOF --fence-host --fence-port` (default `127.0.0.1:1`, an address
+   nothing listens on), then read-only. A replica rejects client writes, so
+   an isolated old master stops accepting writes instead of merely stopping
+   to advertise. Any node that is not leader but finds its instance in the
+   master role fences it the same way.
+7. **Consul blips**: individual Consul errors are tolerated. The leader
+   steps down only when it has not renewed successfully for a full session
+   TTL (by which time Consul has released the lock anyway). A 404 on renew
+   (session gone) demotes immediately.
+8. **Release**: lock release uses Consul's `?release=<session>`, which is
+   atomic and only succeeds if our session still holds the key.
+9. **Shutdown**: SIGTERM removes the master registration and releases the
    lock immediately (fast handover); followers just deregister.
-8. **Flapping**: capped exponential backoff with jitter between elections;
-   `--min-leader-time` reserved for voluntary step-down hysteresis.
+10. **Flapping**: capped exponential backoff with jitter between
+    elections. `--min-leader-time` (default 0 = off): a new leader keeps
+    renewing and holds the lock through local health failures until it has
+    led this long. It never delays involuntary loss (session gone, Consul
+    outage past TTL, lock taken) or shutdown.
 
 ### Observe mode
 
@@ -44,22 +64,28 @@ touches kvrocks (`REPLICAOF`, `CONFIG`) or the service catalog, and logs
 every action it *would* take. Run it alongside Sentinel to validate before
 cutover.
 
-## kvrocks replication notes (verified Oct 2026)
+## kvrocks replication notes (kvrocks 2.11)
 
-From kvrocks docs / supported-commands table:
+Checked against the kvrocks 2.11 source (`GetReplicationInfo`):
 
-| Fact | Status |
-|---|---|
-| `SLAVEOF host port` / `SLAVEOF NO ONE` | supported since v1.0.0 |
-| `REPLICAOF host port` / `REPLICAOF NO ONE` | supported since v2.11.0 (sidecar tries it first, falls back to `SLAVEOF`) |
-| `ROLE` | supported since v1.1.30 |
-| `INFO replication` → `role:master\|slave`, `master_repl_offset` | documented |
-| `CONFIG GET/SET` | supported since v1.0.0; `use-rsid-psync` exists in `kvrocks.conf` (default `no`) — sidecar sets `yes` at startup for partial resync |
-| Replica-side lag fields / read-only flag name (`replica-read-only` vs `slave-read-only`) | **UNVERIFIED** — parsed defensively; unknown lag returns -1 and the hold-down gate applies. `SetReadOnly` tries both names, failures are logged not fatal |
+- Replica: `role:slave`, `master_host`, `master_port`,
+  `master_link_status`, `slave_repl_offset`, and `master_repl_offset`
+  which is the **replica's own** latest sequence. A replica cannot learn
+  its lag from its own INFO.
+- Master: `role:master`, `connected_slaves`,
+  `slaveN:ip=..,port=..,offset=..,lag=..`, `master_repl_offset`.
+- Offsets are RocksDB sequence numbers, **not bytes**. With kvrocks
+  `--max-lag-bytes` is therefore a sequence-number delta (roughly a write
+  count); with Redis it is bytes.
+- Read-only flag is `slave-read-only` (default yes).
+- `REPLICAOF host port` is async: it returns OK even when host is
+  unreachable, which is what makes the fence target work.
 
-Target kvrocks 2.7.0+ (has `REPLICAOF`). Older than 2.11 works via the
-`SLAVEOF` fallback but is untested — verify `INFO replication` output on
-your version before production cutover.
+**Lag gate**: a follower samples the leader's `master_repl_offset` over the
+wire every tick. When the leader goes away it compares the last sample with
+its own offset. Writes the old leader accepted after the last sample are not
+counted, so lag can be under-estimated by up to one tick of writes. With no
+sample (e.g. just started) lag is unknown and the `--hold-down` applies.
 
 ### Running against standalone Redis
 
@@ -79,17 +105,17 @@ below that), `replica-read-only`/`slave-read-only` — is shared. Re-run
 the failure-mode scenarios against Redis before relying on the timings
 above, as PSYNC/full-sync dynamics differ from kvrocks.
 
-## Split-brain window (honest)
+## Split-brain window
 
-Consul sessions + TTL checks are AP-ish during partitions. Worst case: the
-old master is partitioned from Consul but still reachable by clients. It
-demotes itself on the first failed renew/tick (session TTL expiry backs
-this up server-side via `behavior=release`; its TTL check goes critical
-within ~TTL), but in-flight writes during the ~10s window can diverge.
-Mitigations: short TTL (10s), demote-first ordering, lag gate + hold-down
-so the new master refuses a badly-behind replica, and `use-rsid-psync`
-for incremental catch-up. For a 2-node pair without fencing this is the
-expected trade-off; documented here so it is a conscious choice.
+If the old master is partitioned from Consul but still reachable by
+clients, it keeps accepting writes until its sidecar has gone a full TTL
+without a successful renew, then fences itself (replica of the fence target
+or the new leader). Consul releases its lock at about the same time, and the
+follower promotes after lock-delay plus the lag gate. Writes accepted by the
+old master after the last replication to the new one are lost when it
+resyncs from the new leader (same as with Sentinel). If the old master's
+**sidecar** dies, nothing fences kvrocks until the sidecar returns; run it as
+a Nomad sidecar so it is restarted with kvrocks.
 
 ## Failure modes
 
@@ -97,9 +123,10 @@ expected trade-off; documented here so it is a conscious choice.
 |---|---|---|
 | Master's kvrocks dies | Sidecar stops renewing after 3 failed checks (~9s); session expires (≤10s) + lock delay (1s); follower's lag gate passes; promotes | ~15–25s |
 | Master's sidecar dies, kvrocks lives | Session TTL expires without renewal; lock released; follower promotes; old master keeps serving as master until its sidecar returns (then it sees the new leader and follows) — brief dual-master, same as Sentinel | ~TTL + delay ≈ 11s |
-| Master partitioned from Consul | Leader demotes itself (fail TTL + read-only) on first Consul error; follower promotes after session expiry | ~TTL ≈ 10s; isolated old master stops advertising within ~TTL |
+| Master partitioned from Consul | Leader keeps serving until a full TTL without a successful renew, then fences itself; follower promotes after session expiry | ~TTL + delay |
 | Nodes partitioned from each other, both reach Consul | Lock stays with current holder; other side's gate refuses (old master recently seen) until hold-down | no failover (correct) |
-| Consul restarted / brief outage | Both sides error; leader demotes; sessions re-created on return; re-election with backoff | ~outage + 15s |
+| Consul restarted / outage shorter than TTL | Errors tolerated, leader keeps the lock, renew succeeds on return | no failover |
+| Consul outage longer than TTL | Leader fences itself; sessions re-created on return; re-election with backoff | ~outage + seconds |
 | SIGTERM on leader | Deregister + release synchronously | ~1–2s |
 | Both start simultaneously | Empty key race; Consul acquire is atomic — one wins, epoch 1 | ~seconds |
 | Replica far behind (`lag > --max-lag-bytes`) | Promotion refused, stays follower, warns; retries each tick | operator must resync |
@@ -121,9 +148,22 @@ Every flag has an env equivalent (`CONSUL_HTTP_ADDR`, `KVROCKS_ADDR`,
 `ADVERTISE_ADDR`, `CLUSTER_NAME`, `SERVICE_NAME`, `MODE`, …).
 Passwords/tokens are never logged.
 
-Health: `GET :8080/healthz`, `GET :8080/status`, `GET :8080/metrics`
-(`is_leader`, `elections_total`, `leader_changes_total`,
-`lock_held_seconds`, `kvrocks_up`, `replication_lag_bytes`).
+`--advertise-addr-private` (e.g. the NetBird address) also registers a
+second service, `--private-service-name` (default `<service>-private`), with
+the same tags, puts `public`/`private` TaggedAddresses on both entries, and
+makes replicas replicate over the private address.
+
+Health: `GET :8080/healthz` returns 200 only when kvrocks answers, Consul
+has answered within the session TTL, and kvrocks' role matches ours
+(master while leader, replica while follower; skipped in observe mode),
+otherwise 503 with a `problems` list. Also `GET :8080/status`,
+`GET :8080/metrics` (`is_leader`, `elections_total`,
+`leader_changes_total`, `lock_held_seconds`, `kvrocks_up`,
+`replication_lag_bytes`, `fence_failures_total`).
+
+Deploy examples: `deploy/consul-policy.hcl` (per-node ACL policy) and
+`deploy/kvrocks.nomad.hcl` (one group per host; needs
+`-var sidecar_image=...`).
 
 Clients find the master via Consul, e.g. `kvrocks.service.consul` with
 tag `master` (or your `--service-name`/`--master-tag`).
