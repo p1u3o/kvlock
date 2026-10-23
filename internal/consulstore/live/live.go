@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -110,15 +111,56 @@ func (l *Client) Acquire(ctx context.Context, key, session string, value []byte)
 
 // Release uses Consul's ?release=<session> operation, which is atomic on
 // the server: it only clears the lock if this session currently holds it.
-// The value is left in place (it carries the epoch); holders are identified
-// by the session field, not by the value.
+//
+// Consul stores the request body of a release as the new value, so an
+// empty body wipes the epoch, the previous-leader record and any handover
+// hint. Read the current value first and send it back unchanged. Only the
+// holding session can change the value, so it cannot move underneath us.
 func (l *Client) Release(ctx context.Context, key, session string) error {
 	if session == "" {
 		return nil
 	}
+	p, _, err := l.c.KV().Get(key, (&consul.QueryOptions{}).WithContext(ctx))
+	if err != nil {
+		return err
+	}
+	if p == nil || p.Session != session {
+		return nil
+	}
 	q := (&consul.WriteOptions{}).WithContext(ctx)
-	_, _, err := l.c.KV().Release(&consul.KVPair{Key: key, Session: session}, q)
+	_, _, err = l.c.KV().Release(&consul.KVPair{Key: key, Session: session, Value: p.Value}, q)
 	return err
+}
+
+// BumpEpoch stores and returns a counter value that is greater than the
+// stored one and at least min, using check-and-set so concurrent bumps
+// never hand out the same number.
+func (l *Client) BumpEpoch(ctx context.Context, key string, min uint64) (uint64, error) {
+	for i := 0; i < 5; i++ {
+		p, _, err := l.c.KV().Get(key, (&consul.QueryOptions{}).WithContext(ctx))
+		if err != nil {
+			return 0, err
+		}
+		var cur, idx uint64
+		if p != nil {
+			idx = p.ModifyIndex
+			if n, err := strconv.ParseUint(strings.TrimSpace(string(p.Value)), 10, 64); err == nil {
+				cur = n
+			}
+		}
+		next := cur + 1
+		if next < min {
+			next = min
+		}
+		ok, _, err := l.c.KV().CAS(&consul.KVPair{Key: key, Value: []byte(strconv.FormatUint(next, 10)), ModifyIndex: idx}, (&consul.WriteOptions{}).WithContext(ctx))
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return next, nil
+		}
+	}
+	return 0, errors.New("epoch counter: check-and-set kept losing")
 }
 
 func (l *Client) Get(ctx context.Context, key string) ([]byte, string, uint64, error) {

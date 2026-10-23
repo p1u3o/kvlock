@@ -49,6 +49,15 @@ type Session interface {
 	Valid(ctx context.Context, id string) (bool, error)
 }
 
+// EpochCounter is an optional extension of Lock: a counter kept next to
+// the leader key that only ever goes up, so a new leader's epoch is
+// monotonic even if the leader value is lost or rewritten.
+type EpochCounter interface {
+	// BumpEpoch atomically stores and returns a value greater than the
+	// stored counter and at least min.
+	BumpEpoch(ctx context.Context, key string, min uint64) (uint64, error)
+}
+
 // Lock is the KV leader key with session-based acquire.
 type Lock interface {
 	// Acquire tries to hold key with session+value. Returns held?

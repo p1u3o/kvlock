@@ -109,19 +109,74 @@ func TestValid(t *testing.T) {
 	}
 }
 
-func TestReleaseUsesAtomicReleaseOp(t *testing.T) {
+func TestReleaseKeepsValue(t *testing.T) {
+	// Consul stores the release body as the new value; an empty body would
+	// wipe the epoch and any handover hint.
+	val := []byte(`{"node":"kv01","epoch":7}`)
 	c, f := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			b, _ := json.Marshal([]map[string]any{{"Key": "kvrocks/main/leader", "Session": "sess-1", "Value": val, "ModifyIndex": 5}})
+			_, _ = w.Write(b)
+			return
+		}
 		_, _ = w.Write([]byte(`true`))
 	})
 	if err := c.Release(context.Background(), "kvrocks/main/leader", "sess-1"); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.reqs) != 1 {
-		t.Fatalf("expected a single request (no get-then-delete), got %d", len(f.reqs))
+	if len(f.reqs) != 2 {
+		t.Fatalf("expected get + release, got %d requests", len(f.reqs))
 	}
-	r := f.reqs[0]
+	r := f.reqs[1]
 	if r.method != "PUT" || r.path != "/v1/kv/kvrocks/main/leader" || !strings.Contains(r.query, "release=sess-1") {
 		t.Fatalf("unexpected release request: %s %s?%s", r.method, r.path, r.query)
+	}
+	if string(r.body) != string(val) {
+		t.Fatalf("release must send the current value back, sent %q", r.body)
+	}
+}
+
+func TestReleaseSkipsWhenNotHolder(t *testing.T) {
+	c, f := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[{"Key":"k","Session":"other","Value":null}]`))
+	})
+	if err := c.Release(context.Background(), "k", "sess-1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.reqs) != 1 {
+		t.Fatalf("expected only the read, got %d requests", len(f.reqs))
+	}
+}
+
+func TestBumpEpochUsesCASAndRespectsMin(t *testing.T) {
+	var mu sync.Mutex
+	stored, idx := "4", 10
+	c, f := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == "GET" {
+			b, _ := json.Marshal([]map[string]any{{"Key": "kvrocks/main/epoch", "Value": []byte(stored), "ModifyIndex": idx}})
+			_, _ = w.Write(b)
+			return
+		}
+		if r.URL.Query().Get("cas") != "10" {
+			_, _ = w.Write([]byte(`false`))
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = b
+		_, _ = w.Write([]byte(`true`))
+	})
+	n, err := c.BumpEpoch(context.Background(), "kvrocks/main/epoch", 2)
+	if err != nil || n != 5 {
+		t.Fatalf("n=%d err=%v, want 5", n, err)
+	}
+	if got := string(f.reqs[1].body); got != "5" {
+		t.Fatalf("stored %q", got)
+	}
+	n, err = c.BumpEpoch(context.Background(), "kvrocks/main/epoch", 9)
+	if err != nil || n != 9 {
+		t.Fatalf("n=%d err=%v, want 9", n, err)
 	}
 }
 
