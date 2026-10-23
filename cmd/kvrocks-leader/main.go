@@ -34,6 +34,9 @@ func main() {
 		log.Error("consul client failed", map[string]any{"error": err.Error()})
 		os.Exit(1)
 	}
+	if cfg.AdvertiseAddrPrivate != "" {
+		lc.SetPrivate(cfg.PrivateServiceName, cfg.AdvertiseAddrPrivate)
+	}
 
 	c := controller.New(cfg, controller.Deps{
 		Session: lc, Lock: lc, Registrar: lc, KV: kv,

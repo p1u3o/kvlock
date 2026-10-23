@@ -26,8 +26,12 @@ type Config struct {
 
 	NodeName      string
 	AdvertiseAddr string
-	AdvertisePort int
-	Cluster       string
+	// AdvertiseAddrPrivate is an optional second address (e.g. NetBird).
+	AdvertiseAddrPrivate string
+	// PrivateServiceName is the catalog name used for the private address.
+	PrivateServiceName string
+	AdvertisePort      int
+	Cluster            string
 
 	SessionTTL         time.Duration
 	LockDelay          time.Duration
@@ -122,6 +126,8 @@ func Parse(args []string) (*Config, error) {
 
 	fs.StringVar(&c.NodeName, "node", getenv("NODE_NAME", getenv("HOSTNAME", "kv01")), "Local node name ($NODE_NAME)")
 	fs.StringVar(&c.AdvertiseAddr, "advertise-addr", getenv("ADVERTISE_ADDR", ""), "Address to advertise as master ($ADVERTISE_ADDR, default: kvrocks addr)")
+	fs.StringVar(&c.AdvertiseAddrPrivate, "advertise-addr-private", getenv("ADVERTISE_ADDR_PRIVATE", ""), "Optional private-network address (e.g. NetBird). Registered as a second service and used by replicas for replication ($ADVERTISE_ADDR_PRIVATE)")
+	fs.StringVar(&c.PrivateServiceName, "private-service-name", getenv("PRIVATE_SERVICE_NAME", ""), "Consul service name for the private address ($PRIVATE_SERVICE_NAME, default: <service-name>-private)")
 	fs.IntVar(&c.AdvertisePort, "advertise-port", getenvInt("ADVERTISE_PORT", 0), "Port to advertise ($ADVERTISE_PORT, default: kvrocks port)")
 	fs.StringVar(&c.Cluster, "cluster", getenv("CLUSTER_NAME", "main"), "Cluster name; leader key is kvrocks/<cluster>/leader ($CLUSTER_NAME)")
 
@@ -168,6 +174,9 @@ func Parse(args []string) (*Config, error) {
 
 	if c.AdvertiseAddr == "" {
 		c.AdvertiseAddr = c.KvrocksAddr
+	}
+	if c.AdvertiseAddrPrivate != "" && c.PrivateServiceName == "" {
+		c.PrivateServiceName = c.ServiceName + "-private"
 	}
 	if c.AdvertisePort == 0 {
 		c.AdvertisePort = c.KvrocksPort

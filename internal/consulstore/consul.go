@@ -14,12 +14,15 @@ var ErrSessionInvalid = errors.New("consul session invalid")
 
 // LeaderValue is the JSON stored at kvrocks/<cluster>/leader.
 type LeaderValue struct {
-	Node    string `json:"node"`
-	Addr    string `json:"addr"`
-	Port    int    `json:"port"`
-	Session string `json:"session"`
-	Since   string `json:"since"`
-	Epoch   uint64 `json:"epoch"`
+	Node string `json:"node"`
+	Addr string `json:"addr"`
+	Port int    `json:"port"`
+	// PrivateAddr is the leader's address on the private network (e.g.
+	// NetBird). When set, replicas replicate over it instead of Addr.
+	PrivateAddr string `json:"private_addr,omitempty"`
+	Session     string `json:"session"`
+	Since       string `json:"since"`
+	Epoch       uint64 `json:"epoch"`
 }
 
 // Session handles Consul session lifecycle.

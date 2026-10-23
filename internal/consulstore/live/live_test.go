@@ -124,3 +124,41 @@ func TestReleaseUsesAtomicReleaseOp(t *testing.T) {
 		t.Fatalf("unexpected release request: %s %s?%s", r.method, r.path, r.query)
 	}
 }
+
+func TestPrivateAddressRegistersTwin(t *testing.T) {
+	var mu sync.Mutex
+	var regs []map[string]any
+	var dereg []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.URL.Path == "/v1/agent/service/register":
+			var m map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&m)
+			regs = append(regs, m)
+		case strings.HasPrefix(r.URL.Path, "/v1/agent/service/deregister/"):
+			dereg = append(dereg, strings.TrimPrefix(r.URL.Path, "/v1/agent/service/deregister/"))
+		}
+	}))
+	defer srv.Close()
+	c, err := New(strings.TrimPrefix(srv.URL, "http://"), "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetPrivate("kvrocks-private", "100.64.0.1")
+	if err := c.RegisterMaster(context.Background(), "kvrocks", "kv01", "203.0.113.1", 6666, []string{"master"}, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Deregister(context.Background(), "kvrocks-kv01"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(regs) != 2 || regs[0]["Address"] != "203.0.113.1" || regs[1]["Address"] != "100.64.0.1" || regs[1]["Name"] != "kvrocks-private" {
+		t.Fatalf("unexpected registrations: %v", regs)
+	}
+	if len(dereg) != 2 {
+		t.Fatalf("expected both entries deregistered, got %v", dereg)
+	}
+}

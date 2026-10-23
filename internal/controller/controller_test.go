@@ -256,7 +256,7 @@ func TestFollowerPointsAtLeader(t *testing.T) {
 	cfg := testConfig("kv02")
 	kv := &fakeKV{up: true, role: "slave", masterHost: "other", masterPort: 1, lag: 10}
 	lock := &fakeLock{}
-	lv := elect.MarshalLeader("kv01", "10.0.0.9", 6666, "sess-x", 3, time.Now())
+	lv := elect.MarshalLeader("kv01", "10.0.0.9", "", 6666, "sess-x", 3, time.Now())
 	lock.val = lv
 	lock.sess = "sess-x"
 	deps := controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv}
@@ -346,7 +346,7 @@ func TestNodeNameAloneDoesNotGrantLeadership(t *testing.T) {
 	// REPLICAOF itself, and must stop being a writable master.
 	cfg := testConfig("kv01")
 	kv := &fakeKV{up: true, role: "master"}
-	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", 6666, "sess-old", 4, time.Now()), sess: "sess-old"}
+	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "sess-old", 4, time.Now()), sess: "sess-old"}
 	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
 	time.Sleep(150 * time.Millisecond)
 	stop()
@@ -363,7 +363,7 @@ func TestVacantKeyWithOldValueIsElectable(t *testing.T) {
 	// behavior=release leaves the value behind with no session.
 	cfg := testConfig("kv02")
 	kv := &fakeKV{up: true, role: "master", lag: 0}
-	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", 6666, "sess-old", 4, time.Now())}
+	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "sess-old", 4, time.Now())}
 	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
 	time.Sleep(200 * time.Millisecond)
 	stop()
@@ -387,7 +387,7 @@ func TestDemoteFencesByReplicatingNewLeader(t *testing.T) {
 	}
 	lock.mu.Lock()
 	lock.sess = "sess-kv02"
-	lock.val = elect.MarshalLeader("kv02", "10.0.0.2", 6666, "sess-kv02", 9, time.Now())
+	lock.val = elect.MarshalLeader("kv02", "10.0.0.2", "", 6666, "sess-kv02", 9, time.Now())
 	lock.mu.Unlock()
 	time.Sleep(100 * time.Millisecond)
 	if c.Snapshot().Role != elect.RoleFollower {
@@ -440,7 +440,7 @@ func TestLagGateUsesLeaderOffsetSampledBeforeFailure(t *testing.T) {
 			cfg := testConfig("kv02")
 			cfg.HoldDown = time.Hour // known lag must decide, not the hold-down
 			kv := &fakeKV{up: true, role: "slave", masterHost: "10.0.0.1", masterPort: 6666, local: tc.mine, peerOffset: tc.peer}
-			lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", 6666, "sess-kv01", 2, time.Now()), sess: "sess-kv01"}
+			lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "sess-kv01", 2, time.Now()), sess: "sess-kv01"}
 			c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
 			defer stop()
 			time.Sleep(80 * time.Millisecond)
@@ -489,5 +489,19 @@ func TestSnapshotHealthy(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	if s := c.Snapshot(); !s.Healthy || !s.ConsulOK || s.BackendRole != "master" {
 		t.Fatalf("expected healthy leader snapshot, got %+v", s)
+	}
+}
+
+func TestFollowerUsesLeaderPrivateAddr(t *testing.T) {
+	cfg := testConfig("kv02")
+	kv := &fakeKV{up: true, role: "slave", masterHost: "other", masterPort: 1, lag: 10}
+	lock := &fakeLock{val: elect.MarshalLeader("kv01", "203.0.113.9", "100.64.0.9", 6666, "sess-x", 3, time.Now()), sess: "sess-x"}
+	deps := controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv}
+	_, _, _, fkv := runCtl(t, cfg, deps, 200*time.Millisecond)
+	fkv.mu.Lock()
+	host := fkv.masterHost
+	fkv.mu.Unlock()
+	if host != "100.64.0.9" {
+		t.Fatalf("expected replication over private addr, got %q", host)
 	}
 }

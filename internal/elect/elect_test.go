@@ -48,14 +48,14 @@ func TestNextEpoch(t *testing.T) {
 	if e := elect.NextEpoch([]byte("garbage")); e != 1 {
 		t.Fatalf("want 1 got %d", e)
 	}
-	v := elect.MarshalLeader("kv01", "10.0.0.1", 6666, "sess", 4, time.Now())
+	v := elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "sess", 4, time.Now())
 	if e := elect.NextEpoch(v); e != 5 {
 		t.Fatalf("want 5 got %d", e)
 	}
 }
 
 func TestMarshalParseRoundTrip(t *testing.T) {
-	v := elect.MarshalLeader("kv01", "10.0.0.1", 6666, "s1", 7, time.Now())
+	v := elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "s1", 7, time.Now())
 	lv := elect.ParseLeader(v)
 	if lv == nil || lv.Node != "kv01" || lv.Epoch != 7 || lv.Port != 6666 {
 		t.Fatalf("bad round trip: %+v", lv)

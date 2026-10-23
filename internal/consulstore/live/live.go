@@ -3,7 +3,9 @@ package live
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	consul "github.com/hashicorp/consul/api"
@@ -14,6 +16,8 @@ import (
 // Client bundles session, lock and registrar over one *consul.Client.
 type Client struct {
 	c *consul.Client
+
+	privService, privAddr string
 }
 
 func New(addr, token, caFile string, skipVerify bool) (*Client, error) {
@@ -153,21 +157,54 @@ func (l *Client) Watch(ctx context.Context, key string, waitIndex uint64, waitTi
 
 func serviceID(service, node string) string { return fmt.Sprintf("%s-%s", service, node) }
 
+// SetPrivate makes every registration also publish a second service entry
+// (privateService) carrying the private address, with the same tags and
+// lifecycle. Both entries carry the other address in TaggedAddresses.
+func (l *Client) SetPrivate(privateService, privateAddr string) {
+	l.privService, l.privAddr = privateService, privateAddr
+}
+
+// privID maps a public service ID to its private twin, "" when disabled.
+func (l *Client) privID(id string) string {
+	if l.privAddr == "" || l.privService == "" {
+		return ""
+	}
+	return "private:" + id
+}
+
 func (l *Client) RegisterMaster(ctx context.Context, service, node, addr string, port int, tags []string, ttl time.Duration) error {
-	return l.register(ctx, serviceID(service, node), service, addr, port, tags, ttl)
+	return l.registerBoth(ctx, serviceID(service, node), service, addr, port, tags, ttl)
 }
 
 func (l *Client) RegisterReplica(ctx context.Context, service, node, addr string, port int, tags []string, ttl time.Duration) error {
-	return l.register(ctx, serviceID(service, node), service, addr, port, tags, ttl)
+	return l.registerBoth(ctx, serviceID(service, node), service, addr, port, tags, ttl)
 }
 
-func (l *Client) register(ctx context.Context, id, service, addr string, port int, tags []string, ttl time.Duration) error {
+func (l *Client) registerBoth(ctx context.Context, id, service, addr string, port int, tags []string, ttl time.Duration) error {
+	tagged := map[string]consul.ServiceAddress(nil)
+	if l.privID(id) != "" {
+		tagged = map[string]consul.ServiceAddress{
+			"public":  {Address: addr, Port: port},
+			"private": {Address: l.privAddr, Port: port},
+		}
+	}
+	if err := l.register(ctx, id, service, addr, port, tags, ttl, tagged); err != nil {
+		return err
+	}
+	if pid := l.privID(id); pid != "" {
+		return l.register(ctx, pid, l.privService, l.privAddr, port, tags, ttl, tagged)
+	}
+	return nil
+}
+
+func (l *Client) register(ctx context.Context, id, service, addr string, port int, tags []string, ttl time.Duration, tagged map[string]consul.ServiceAddress) error {
 	reg := &consul.AgentServiceRegistration{
-		ID:      id,
-		Name:    service,
-		Address: addr,
-		Port:    port,
-		Tags:    tags,
+		TaggedAddresses: tagged,
+		ID:              id,
+		Name:            service,
+		Address:         addr,
+		Port:            port,
+		Tags:            tags,
 		Check: &consul.AgentServiceCheck{
 			TTL:    ttl.String(),
 			Status: consul.HealthPassing,
@@ -179,17 +216,29 @@ func (l *Client) register(ctx context.Context, id, service, addr string, port in
 
 func (l *Client) PassTTL(ctx context.Context, checkID string) error {
 	_ = ctx
-	return l.c.Agent().PassTTL(checkID, "")
+	err := l.c.Agent().PassTTL(checkID, "")
+	if pid := l.privID(strings.TrimPrefix(checkID, "service:")); pid != "" {
+		err = errors.Join(err, l.c.Agent().PassTTL(l.CheckID(pid), ""))
+	}
+	return err
 }
 
 func (l *Client) FailTTL(ctx context.Context, checkID string) error {
 	_ = ctx
-	return l.c.Agent().FailTTL(checkID, "")
+	err := l.c.Agent().FailTTL(checkID, "")
+	if pid := l.privID(strings.TrimPrefix(checkID, "service:")); pid != "" {
+		err = errors.Join(err, l.c.Agent().FailTTL(l.CheckID(pid), ""))
+	}
+	return err
 }
 
 func (l *Client) Deregister(ctx context.Context, serviceID string) error {
 	_ = ctx
-	return l.c.Agent().ServiceDeregister(serviceID)
+	err := l.c.Agent().ServiceDeregister(serviceID)
+	if pid := l.privID(serviceID); pid != "" {
+		err = errors.Join(err, l.c.Agent().ServiceDeregister(pid))
+	}
+	return err
 }
 
 func (l *Client) CheckID(serviceID string) string { return "service:" + serviceID }

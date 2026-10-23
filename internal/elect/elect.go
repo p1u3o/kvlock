@@ -60,9 +60,9 @@ func NextEpoch(raw []byte) uint64 {
 }
 
 // MarshalLeader builds the lock value.
-func MarshalLeader(node, addr string, port int, session string, epoch uint64, since time.Time) []byte {
+func MarshalLeader(node, addr, privateAddr string, port int, session string, epoch uint64, since time.Time) []byte {
 	lv := consulstore.LeaderValue{
-		Node: node, Addr: addr, Port: port,
+		Node: node, Addr: addr, PrivateAddr: privateAddr, Port: port,
 		Session: session, Since: since.UTC().Format(time.RFC3339Nano), Epoch: epoch,
 	}
 	b, _ := json.Marshal(lv)

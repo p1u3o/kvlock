@@ -453,10 +453,18 @@ func (c *Controller) onFollow(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 // followTarget returns where to replicate from, or nil when lv does not
 // describe another node we can follow.
 func (c *Controller) followTarget(lv *consulstore.LeaderValue) *consulstore.LeaderValue {
-	if lv == nil || lv.Node == c.cfg.NodeName || lv.Addr == "" || lv.Port == 0 {
+	if lv == nil || lv.Node == c.cfg.NodeName || lv.Port == 0 {
 		return nil
 	}
-	return lv
+	t := *lv
+	if t.PrivateAddr != "" {
+		// Replicate over the private network when the leader has one.
+		t.Addr = t.PrivateAddr
+	}
+	if t.Addr == "" {
+		return nil
+	}
+	return &t
 }
 
 // isFenced reports whether the local instance already refuses writes:
@@ -507,7 +515,7 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	if dec.Reason != "lag within bound" {
 		c.log.Warn("promoting with unknown lag", map[string]any{"reason": dec.Reason})
 	}
-	value := elect.MarshalLeader(c.cfg.NodeName, c.cfg.AdvertiseAddr, c.cfg.AdvertisePort, c.sessionIDValue(), epoch, time.Now())
+	value := elect.MarshalLeader(c.cfg.NodeName, c.cfg.AdvertiseAddr, c.cfg.AdvertiseAddrPrivate, c.cfg.AdvertisePort, c.sessionIDValue(), epoch, time.Now())
 	if c.cfg.Mode == "observe" {
 		c.log.Info("observe: would acquire lock and promote", map[string]any{"epoch": epoch, "lag": lag})
 		c.mu.Lock()
@@ -538,7 +546,7 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	}
 	c.promote(ctx)
 	c.mu.Lock()
-	c.leader = &consulstore.LeaderValue{Node: c.cfg.NodeName, Addr: c.cfg.AdvertiseAddr, Port: c.cfg.AdvertisePort, Session: sid, Epoch: epoch}
+	c.leader = &consulstore.LeaderValue{Node: c.cfg.NodeName, Addr: c.cfg.AdvertiseAddr, PrivateAddr: c.cfg.AdvertiseAddrPrivate, Port: c.cfg.AdvertisePort, Session: sid, Epoch: epoch}
 	c.leaderSince = time.Now()
 	c.mu.Unlock()
 	c.setRole(elect.RoleLeader)
