@@ -282,3 +282,41 @@ func (c *Controller) onHandoverHint(ctx context.Context, ri *kvrocks.Replication
 	c.mu.Unlock()
 	return false
 }
+
+// shutdownHandover tries a planned handover while the leader shuts down,
+// so a restart costs the cluster a lock hand-off instead of TTL and
+// lock-delay. It runs on the control loop goroutine after the loop has
+// stopped. It waits at most cfg.ShutdownHandover for a caught-up replica;
+// false means the caller must fall back to fence-then-release (a failed
+// commit has already restored leadership).
+func (c *Controller) shutdownHandover(ctx context.Context) bool {
+	hctx, cancel := context.WithTimeout(ctx, c.cfg.ShutdownHandover)
+	defer cancel()
+	maxLag := c.cfg.HandoverMaxLag
+	poll := minDur(c.cfg.CheckInterval, 200*time.Millisecond)
+	if poll <= 0 {
+		poll = 100 * time.Millisecond
+	}
+	for {
+		_, _, why := c.handoverReady(hctx, "", maxLag)
+		if why == "" {
+			break
+		}
+		select {
+		case <-hctx.Done():
+			c.log.Warn("handover on shutdown skipped", map[string]any{"reason": why})
+			c.reg.Handovers.WithLabelValues("aborted").Inc()
+			return false
+		case <-time.After(poll):
+		}
+	}
+	cr := c.commitHandover(hctx, "", maxLag, c.cfg.HandoverTimeout)
+	if cr.err != nil {
+		c.log.Warn("handover on shutdown failed; fencing and releasing instead", map[string]any{"error": cr.err.Error()})
+		c.reg.Handovers.WithLabelValues("aborted").Inc()
+		return false
+	}
+	c.reg.Handovers.WithLabelValues("ok").Inc()
+	c.log.Info("handed over on shutdown", map[string]any{"target": cr.target, "lag": cr.lag})
+	return true
+}

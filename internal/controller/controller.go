@@ -893,6 +893,9 @@ func (c *Controller) shutdown(ctx context.Context) {
 		c.releaseSession(ctx)
 		return
 	}
+	if wasLeader && c.cfg.ShutdownHandover > 0 && c.shutdownHandover(ctx) {
+		return
+	}
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	_ = c.deps.Registrar.FailTTL(sctx, c.deps.Registrar.CheckID(c.serviceID()))

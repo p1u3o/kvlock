@@ -92,6 +92,9 @@ type Config struct {
 	// HandoverMaxLag is the lag bound for a planned handover; < 0 means
 	// use MaxLagBytes.
 	HandoverMaxLag int64
+	// ShutdownHandover bounds the planned handover a leader attempts on
+	// SIGTERM before falling back to fence-then-release; 0 disables it.
+	ShutdownHandover time.Duration
 
 	CheckInterval time.Duration
 }
@@ -200,6 +203,7 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.AdminTokenFile, "admin-token-file", getenv("KVLOCK_ADMIN_TOKEN_FILE", ""), "File containing the admin token ($KVLOCK_ADMIN_TOKEN_FILE)")
 	fs.DurationVar(&c.HandoverTimeout, "handover-timeout", getenvDur("HANDOVER_TIMEOUT", 30*time.Second), "Planned handover: max wait for a replica to catch up ($HANDOVER_TIMEOUT)")
 	fs.Int64Var(&c.HandoverMaxLag, "handover-max-lag", getenvInt64("HANDOVER_MAX_LAG", -1), "Planned handover lag bound; -1 = --max-lag-bytes ($HANDOVER_MAX_LAG)")
+	fs.DurationVar(&c.ShutdownHandover, "shutdown-handover-timeout", getenvDur("SHUTDOWN_HANDOVER_TIMEOUT", 5*time.Second), "On shutdown as leader, hand over to a caught-up replica within this time before fencing and releasing; 0 = off ($SHUTDOWN_HANDOVER_TIMEOUT)")
 	fs.DurationVar(&c.CheckInterval, "check-interval", getenvDur("CHECK_INTERVAL", 3*time.Second), "kvrocks health check interval ($CHECK_INTERVAL)")
 
 	if err := fs.Parse(args); err != nil {
@@ -272,6 +276,9 @@ func Parse(args []string) (*Config, error) {
 	}
 	if c.HandoverMaxLag < 0 {
 		c.HandoverMaxLag = c.MaxLagBytes
+	}
+	if c.ShutdownHandover < 0 {
+		return nil, fmt.Errorf("invalid --shutdown-handover-timeout %v", c.ShutdownHandover)
 	}
 	if c.HandoverTimeout <= 0 {
 		return nil, fmt.Errorf("invalid --handover-timeout %v", c.HandoverTimeout)

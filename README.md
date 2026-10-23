@@ -276,6 +276,17 @@ v0.1 sidecars ignore the hint (upgrade all nodes first); there is a short
 write outage between fencing and the target's promotion (normally one
 check interval).
 
+### Handover on shutdown
+
+On SIGTERM/SIGINT a leader first tries the same planned handover to the
+least-lagged online replica, waiting at most `--shutdown-handover-timeout`
+(`$SHUTDOWN_HANDOVER_TIMEOUT`, default 5s, 0 = off) for it to be within
+`--handover-max-lag`. If there is no such replica in time, or the commit
+fails, it falls back to fence-then-release. The local kvrocks must still be
+running when the sidecar gets the signal (in Nomad, run kvrocks as the
+prestart sidecar task and kvrocks-leader as the main task so it is stopped
+first), and the sidecar's kill timeout must exceed the handover timeout.
+
 ## Leader proxy
 
 `--proxy-addr :6380` (`$PROXY_ADDR`) on every sidecar opens a plain TCP
