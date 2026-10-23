@@ -37,6 +37,7 @@ type Controller struct {
 	leader         *consulstore.LeaderValue
 	lag            int64
 	kvUp           bool
+	backendRole    string // role reported by the local instance's INFO
 	sessionID      string
 	sessionValid   bool
 	unhealthy      int
@@ -74,7 +75,11 @@ func New(cfg *config.Config, deps Deps, log *logx.Logger, reg *metrics.Registry)
 func (c *Controller) Snapshot() httpapi.Snapshot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	s := httpapi.Snapshot{Role: c.role, LagBytes: c.lag, KvrocksUp: c.kvUp, Mode: c.cfg.Mode, SessionValid: c.sessionValid, UnhealthyStreak: c.unhealthy}
+	consulOK := !c.lastConsulOK.IsZero() && time.Since(c.lastConsulOK) < c.cfg.SessionTTL
+	s := httpapi.Snapshot{Role: c.role, LagBytes: c.lag, KvrocksUp: c.kvUp, Mode: c.cfg.Mode, SessionValid: c.sessionValid, UnhealthyStreak: c.unhealthy,
+		ConsulOK: consulOK, BackendRole: c.backendRole}
+	s.Problems = elect.HealthProblems(c.role, c.backendRole, c.kvUp, consulOK, c.cfg.Mode == "observe")
+	s.Healthy = len(s.Problems) == 0
 	if c.leader != nil {
 		s.Leader = c.leader.Node
 		s.LeaderAddr = c.leader.Addr
@@ -174,11 +179,12 @@ func (c *Controller) renewSession(ctx context.Context) {
 	if sid == "" {
 		return
 	}
-	// Renew only while local kvrocks is healthy.
+	// Renew only while local kvrocks is healthy (or a new leader is still
+	// inside --min-leader-time).
 	c.mu.RLock()
 	up := c.kvUp
 	c.mu.RUnlock()
-	if !up {
+	if !up && !c.inMinLeaderTime() {
 		c.log.Warn("skipping session renew: kvrocks unhealthy", nil)
 		return
 	}
@@ -211,6 +217,16 @@ func (c *Controller) renewSession(ctx context.Context) {
 	c.mu.Unlock()
 }
 
+// inMinLeaderTime reports whether we are a leader that has not yet held the
+// lock for --min-leader-time. During that window we do not voluntarily hand
+// over because of local health failures (anti-flap). Involuntary loss
+// (session invalid, Consul outage, lock taken, shutdown) is never delayed.
+func (c *Controller) inMinLeaderTime() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.role == elect.RoleLeader && elect.WithinMinLeaderTime(c.leaderSince, time.Now(), c.cfg.MinLeaderTime)
+}
+
 func (c *Controller) isLeader() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -228,9 +244,11 @@ func (c *Controller) tick(ctx context.Context) {
 	if perr != nil {
 		c.kvUp = false
 		c.unhealthy++
+		c.backendRole = ""
 	} else {
 		c.kvUp = true
 		c.unhealthy = 0
+		c.backendRole = ri.Role
 	}
 	unhealthy := c.unhealthy
 	c.mu.Unlock()
@@ -238,7 +256,9 @@ func (c *Controller) tick(ctx context.Context) {
 
 	if perr != nil {
 		c.log.Warn("kvrocks unhealthy", map[string]any{"streak": unhealthy, "error": perr.Error()})
-		if unhealthy >= c.cfg.UnhealthyThreshold {
+		if unhealthy >= c.cfg.UnhealthyThreshold && c.inMinLeaderTime() {
+			c.log.Warn("kvrocks unhealthy but within min-leader-time; holding lock", map[string]any{"min_leader_time": c.cfg.MinLeaderTime.String()})
+		} else if unhealthy >= c.cfg.UnhealthyThreshold {
 			// Stop renewing (renewSession gates on kvUp next round) and
 			// proactively release + demote if leader.
 			if c.isLeader() {

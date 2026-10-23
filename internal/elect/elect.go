@@ -139,3 +139,39 @@ func ComputeLag(leaderOffset int64, haveSample bool, localOffset int64) int64 {
 	}
 	return 0
 }
+
+// WithinMinLeaderTime reports whether a leader since `since` is still inside
+// the minimum leadership window. min <= 0 disables the window.
+func WithinMinLeaderTime(since, now time.Time, min time.Duration) bool {
+	return min > 0 && !since.IsZero() && now.Sub(since) < min
+}
+
+// HealthProblems lists why the sidecar is unhealthy; empty means healthy.
+// backendRole is the role the local instance reports ("master"/"slave").
+// In observe mode the sidecar never changes the instance's role, so role
+// consistency is not checked.
+func HealthProblems(role Role, backendRole string, backendUp, consulOK, observe bool) []string {
+	var p []string
+	if !backendUp {
+		p = append(p, "backend unreachable")
+	}
+	if !consulOK {
+		p = append(p, "consul unreachable")
+	}
+	if observe || !backendUp {
+		return p
+	}
+	switch role {
+	case RoleLeader:
+		if backendRole != "master" {
+			p = append(p, "leader but backend role is "+backendRole)
+		}
+	case RoleFollower:
+		if backendRole != "slave" {
+			p = append(p, "follower but backend role is "+backendRole)
+		}
+	default:
+		p = append(p, "role not yet determined")
+	}
+	return p
+}

@@ -19,6 +19,10 @@ type Snapshot struct {
 	Mode            string     `json:"mode"`
 	SessionValid    bool       `json:"session_valid"`
 	UnhealthyStreak int        `json:"unhealthy_streak"`
+	ConsulOK        bool       `json:"consul_ok"`
+	BackendRole     string     `json:"backend_role,omitempty"`
+	Healthy         bool       `json:"healthy"`
+	Problems        []string   `json:"problems,omitempty"`
 }
 
 // Provider supplies the current snapshot + metrics.
@@ -33,11 +37,10 @@ func Handler(p Provider) http.Handler {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		snap := p.Snapshot()
 		w.Header().Set("Content-Type", "application/json")
-		if !snap.KvrocksUp && snap.Role != elect.RoleLeader {
-			// Follower with down kvrocks is still alive as a process; report degraded.
-			w.WriteHeader(http.StatusOK)
+		if !snap.Healthy {
+			w.WriteHeader(http.StatusServiceUnavailable)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "role": snap.Role})
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": snap.Healthy, "role": snap.Role, "problems": snap.Problems})
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

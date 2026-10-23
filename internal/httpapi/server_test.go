@@ -10,10 +10,16 @@ import (
 	"github.com/example/kvrocks-leader/internal/metrics"
 )
 
-type stub struct{ reg *metrics.Registry }
+type stub struct {
+	reg       *metrics.Registry
+	unhealthy bool
+}
 
 func (s stub) Snapshot() httpapi.Snapshot {
-	return httpapi.Snapshot{Role: elect.RoleLeader, Leader: "kv01", Epoch: 3, LagBytes: 0, KvrocksUp: true, Mode: "active"}
+	if s.unhealthy {
+		return httpapi.Snapshot{Role: elect.RoleLeader, Mode: "active", Problems: []string{"backend unreachable"}}
+	}
+	return httpapi.Snapshot{Role: elect.RoleLeader, Leader: "kv01", Epoch: 3, LagBytes: 0, KvrocksUp: true, Mode: "active", Healthy: true, ConsulOK: true}
 }
 func (s stub) Metrics() *metrics.Registry { return s.reg }
 
@@ -41,5 +47,26 @@ func TestEndpoints(t *testing.T) {
 	}
 	if snap.Role != elect.RoleLeader || snap.Epoch != 3 {
 		t.Fatalf("bad snapshot: %+v", snap)
+	}
+}
+
+func TestHealthzUnhealthyIs503(t *testing.T) {
+	srv := httptest.NewServer(httpapi.Handler(stub{reg: metrics.New(), unhealthy: true}))
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Fatalf("expected 503, got %d", resp.StatusCode)
+	}
+	var body struct {
+		OK       bool     `json:"ok"`
+		Problems []string `json:"problems"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if body.OK || len(body.Problems) == 0 {
+		t.Fatalf("bad body: %+v", body)
 	}
 }

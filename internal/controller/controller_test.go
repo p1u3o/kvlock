@@ -461,3 +461,33 @@ func TestLagGateUsesLeaderOffsetSampledBeforeFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestMinLeaderTimeDefersVoluntaryHandover(t *testing.T) {
+	cfg := testConfig("kv01")
+	cfg.MinLeaderTime = time.Hour
+	kv := &fakeKV{up: true, role: "master"}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: &fakeLock{}, Registrar: &fakeRegistrar{}, KV: kv})
+	defer stop()
+	time.Sleep(80 * time.Millisecond)
+	kv.mu.Lock()
+	kv.up = false
+	kv.mu.Unlock()
+	time.Sleep(150 * time.Millisecond)
+	if c.Snapshot().Role != elect.RoleLeader {
+		t.Fatal("must keep the lock inside min-leader-time")
+	}
+	if c.Snapshot().Healthy {
+		t.Fatal("healthz must report unhealthy while the backend is down")
+	}
+}
+
+func TestSnapshotHealthy(t *testing.T) {
+	cfg := testConfig("kv01")
+	kv := &fakeKV{up: true, role: "master"}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: &fakeLock{}, Registrar: &fakeRegistrar{}, KV: kv})
+	defer stop()
+	time.Sleep(80 * time.Millisecond)
+	if s := c.Snapshot(); !s.Healthy || !s.ConsulOK || s.BackendRole != "master" {
+		t.Fatalf("expected healthy leader snapshot, got %+v", s)
+	}
+}

@@ -117,3 +117,40 @@ func TestComputeLag(t *testing.T) {
 		t.Fatalf("unknown local should be unknown, got %d", got)
 	}
 }
+
+func TestWithinMinLeaderTime(t *testing.T) {
+	now := time.Now()
+	if !elect.WithinMinLeaderTime(now.Add(-time.Second), now, 5*time.Second) {
+		t.Fatal("1s into 5s window should be within")
+	}
+	if elect.WithinMinLeaderTime(now.Add(-6*time.Second), now, 5*time.Second) {
+		t.Fatal("past window")
+	}
+	if elect.WithinMinLeaderTime(now, now, 0) {
+		t.Fatal("0 disables")
+	}
+	if elect.WithinMinLeaderTime(time.Time{}, now, 5*time.Second) {
+		t.Fatal("not leader")
+	}
+}
+
+func TestHealthProblems(t *testing.T) {
+	if p := elect.HealthProblems(elect.RoleLeader, "master", true, true, false); len(p) != 0 {
+		t.Fatalf("healthy leader: %v", p)
+	}
+	if p := elect.HealthProblems(elect.RoleFollower, "slave", true, true, false); len(p) != 0 {
+		t.Fatalf("healthy follower: %v", p)
+	}
+	if p := elect.HealthProblems(elect.RoleFollower, "master", true, true, false); len(p) != 1 {
+		t.Fatalf("follower on a master must be inconsistent: %v", p)
+	}
+	if p := elect.HealthProblems(elect.RoleLeader, "slave", true, true, false); len(p) != 1 {
+		t.Fatalf("leader on a replica must be inconsistent: %v", p)
+	}
+	if p := elect.HealthProblems(elect.RoleLeader, "", false, false, false); len(p) != 2 {
+		t.Fatalf("expected backend+consul problems: %v", p)
+	}
+	if p := elect.HealthProblems(elect.RoleFollower, "master", true, true, true); len(p) != 0 {
+		t.Fatalf("observe mode skips role check: %v", p)
+	}
+}

@@ -139,7 +139,7 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.Mode, "mode", getenv("MODE", "active"), "Mode: active|observe ($MODE)")
 	fs.StringVar(&c.FenceHost, "fence-host", getenv("FENCE_HOST", "127.0.0.1"), "REPLICAOF target used to fence a demoted master when the leader is unknown ($FENCE_HOST)")
 	fs.IntVar(&c.FencePort, "fence-port", getenvInt("FENCE_PORT", 1), "Port for --fence-host; must have nothing listening ($FENCE_PORT)")
-	fs.DurationVar(&c.MinLeaderTime, "min-leader-time", getenvDur("MIN_LEADER_TIME", 30*time.Second), "Minimum time to stay leader before voluntary step-down ($MIN_LEADER_TIME)")
+	fs.DurationVar(&c.MinLeaderTime, "min-leader-time", getenvDur("MIN_LEADER_TIME", 0), "After winning, hold the lock at least this long before voluntarily handing over on local health failures; 0 disables ($MIN_LEADER_TIME)")
 	fs.DurationVar(&c.ReelectBaseBackoff, "reelect-base-backoff", getenvDur("REELECT_BASE_BACKOFF", 1*time.Second), "Base backoff between elections ($REELECT_BASE_BACKOFF)")
 	fs.DurationVar(&c.ReelectMaxBackoff, "reelect-max-backoff", getenvDur("REELECT_MAX_BACKOFF", 15*time.Second), "Max backoff between elections ($REELECT_MAX_BACKOFF)")
 
