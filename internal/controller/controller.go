@@ -131,8 +131,13 @@ func (c *Controller) ensureSession(ctx context.Context) {
 	c.mu.RLock()
 	sid := c.sessionID
 	c.mu.RUnlock()
-	if sid != "" && c.deps.Session.Valid(sid) {
-		return
+	if sid != "" {
+		ok, err := c.deps.Session.Valid(ctx, sid)
+		if err != nil || ok {
+			// Still valid, or Consul unreachable: keep the current session
+			// rather than churning a new one.
+			return
+		}
 	}
 	// (Re)create only while kvrocks healthy; checked in tick, but also gate here.
 	id, err := c.deps.Session.Create(ctx, c.cfg.SessionTTL, c.cfg.LockDelay)

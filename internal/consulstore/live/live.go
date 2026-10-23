@@ -7,6 +7,8 @@ import (
 	"time"
 
 	consul "github.com/hashicorp/consul/api"
+
+	"github.com/example/kvrocks-leader/internal/consulstore"
 )
 
 // Client bundles session, lock and registrar over one *consul.Client.
@@ -38,68 +40,85 @@ func New(addr, token, caFile string, skipVerify bool) (*Client, error) {
 
 // --- Session ---
 
+// Create makes a TTL session with behavior=release and NO health checks.
+//
+// Consul's default for a session with no explicit checks is to attach the
+// node's serfHealth check, which means any node-level critical check (or a
+// serf flap) would invalidate the session and drop the lock. We create the
+// session with an explicitly empty NodeChecks list so the TTL, which we
+// renew ourselves, is the only thing that can invalidate it.
 func (l *Client) Create(ctx context.Context, ttl, lockDelay time.Duration) (string, error) {
-	se := l.c.Session()
-	id, _, err := se.Create(&consul.SessionEntry{
+	q := (&consul.WriteOptions{}).WithContext(ctx)
+	id, _, err := l.c.Session().CreateNoChecks(&consul.SessionEntry{
 		Name:      "kvrocks-leader",
 		Behavior:  consul.SessionBehaviorRelease,
 		TTL:       ttl.String(),
 		LockDelay: lockDelay,
-	}, nil)
+	}, q)
 	if err != nil {
 		return "", err
 	}
-	// Prime periodic renew via session renew goroutine? Caller renews explicitly.
-	_ = ctx
 	return id, nil
 }
 
+// Renew refreshes the session TTL. A 404 from Consul (session gone) is
+// reported as consulstore.ErrSessionInvalid so callers can tell "the lock
+// is definitely lost" apart from "Consul is temporarily unreachable".
 func (l *Client) Renew(ctx context.Context, id string) error {
-	_, _, err := l.c.Session().Renew(id, nil)
-	_ = ctx
-	return err
+	q := (&consul.WriteOptions{}).WithContext(ctx)
+	entry, _, err := l.c.Session().Renew(id, q)
+	if err != nil {
+		return err
+	}
+	if entry == nil {
+		return consulstore.ErrSessionInvalid
+	}
+	return nil
 }
 
 func (l *Client) Destroy(ctx context.Context, id string) error {
-	_, err := l.c.Session().Destroy(id, nil)
-	_ = ctx
+	q := (&consul.WriteOptions{}).WithContext(ctx)
+	_, err := l.c.Session().Destroy(id, q)
 	return err
 }
 
-func (l *Client) Valid(id string) bool {
+// Valid reports whether the session still exists. The error is non-nil
+// only when Consul could not be asked.
+func (l *Client) Valid(ctx context.Context, id string) (bool, error) {
 	if id == "" {
-		return false
+		return false, nil
 	}
-	_, _, err := l.c.Session().Info(id, nil)
-	return err == nil
+	q := (&consul.QueryOptions{}).WithContext(ctx)
+	entry, _, err := l.c.Session().Info(id, q)
+	if err != nil {
+		return false, err
+	}
+	return entry != nil, nil
 }
 
 // --- Lock ---
 
 func (l *Client) Acquire(ctx context.Context, key, session string, value []byte) (bool, error) {
-	kv := l.c.KV()
-	ok, _, err := kv.Acquire(&consul.KVPair{Key: key, Session: session, Value: value}, nil)
-	_ = ctx
+	q := (&consul.WriteOptions{}).WithContext(ctx)
+	ok, _, err := l.c.KV().Acquire(&consul.KVPair{Key: key, Session: session, Value: value}, q)
 	return ok, err
 }
 
+// Release uses Consul's ?release=<session> operation, which is atomic on
+// the server: it only clears the lock if this session currently holds it.
+// The value is left in place (it carries the epoch); holders are identified
+// by the session field, not by the value.
 func (l *Client) Release(ctx context.Context, key, session string) error {
-	kv := l.c.KV()
-	p, _, err := kv.Get(key, nil)
-	if err != nil {
-		return err
+	if session == "" {
+		return nil
 	}
-	if p == nil || p.Session != session {
-		return nil // not ours
-	}
-	_, err = kv.Delete(key, nil)
-	_ = ctx
+	q := (&consul.WriteOptions{}).WithContext(ctx)
+	_, _, err := l.c.KV().Release(&consul.KVPair{Key: key, Session: session}, q)
 	return err
 }
 
 func (l *Client) Get(ctx context.Context, key string) ([]byte, string, uint64, error) {
-	p, meta, err := l.c.KV().Get(key, nil)
-	_ = ctx
+	p, meta, err := l.c.KV().Get(key, (&consul.QueryOptions{}).WithContext(ctx))
 	if err != nil {
 		return nil, "", 0, err
 	}

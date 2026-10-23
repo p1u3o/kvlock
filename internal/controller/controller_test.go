@@ -49,10 +49,10 @@ func (f *fakeSession) Destroy(ctx context.Context, id string) error {
 	f.valid = false
 	return nil
 }
-func (f *fakeSession) Valid(id string) bool {
+func (f *fakeSession) Valid(ctx context.Context, id string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.valid && id == f.id
+	return f.valid && id == f.id, nil
 }
 
 type errString string
