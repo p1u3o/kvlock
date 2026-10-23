@@ -180,21 +180,38 @@ type fakeKV struct {
 	killedWhileMaster bool
 	replicas          []kvrocks.ReplicaState
 	failReplicaOf     bool
+
+	downErr   error // returned while !up (default "down")
+	hang      bool  // InfoReplication blocks until the context ends
+	rsidCalls int
+	rsidOK    int
+}
+
+func (f *fakeKV) downError() error {
+	if f.downErr != nil {
+		return f.downErr
+	}
+	return errString("down")
 }
 
 func (f *fakeKV) Ping(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.up {
-		return errString("down")
+		return f.downError()
 	}
 	return nil
 }
 func (f *fakeKV) InfoReplication(ctx context.Context) (*kvrocks.ReplicationInfo, error) {
 	f.mu.Lock()
+	if f.hang {
+		f.mu.Unlock()
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	defer f.mu.Unlock()
 	if !f.up {
-		return nil, errString("down")
+		return nil, f.downError()
 	}
 	ri := &kvrocks.ReplicationInfo{Role: f.role, MasterHost: f.masterHost, MasterPort: f.masterPort, LagBytes: f.lag, LocalOffset: f.local, MasterOffset: -1, MasterLinkUp: true}
 	if f.role == "master" {
@@ -235,7 +252,16 @@ func (f *fakeKV) Promote(ctx context.Context) error {
 	f.readonly = false
 	return nil
 }
-func (f *fakeKV) EnsureRsIDPsync(ctx context.Context) error { return nil }
+func (f *fakeKV) EnsureRsIDPsync(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rsidCalls++
+	if !f.up {
+		return f.downError()
+	}
+	f.rsidOK++
+	return nil
+}
 func (f *fakeKV) SetReadOnly(ctx context.Context, ro bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

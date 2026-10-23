@@ -51,8 +51,11 @@ Each sidecar runs next to its local kvrocks and loops every
 9. **Shutdown**: SIGTERM removes the master registration, fences the local
    instance (REPLICAOF the fence target, confirmed with INFO), drops client
    connections and only then releases the lock, so the next leader never
-   overlaps with this one. If fencing fails the lock is left to expire with
-   the session. Followers just deregister. Give the task a kill timeout of
+   overlaps with this one. If nothing answers on the local address
+   (connection refused, or no reply within min(kvrocks timeout, 1s), three
+   tries) the instance is treated as gone and the lock is released at once;
+   this relies on kvrocks booting fenced (`replicaof` in its config). If it
+   answers but fencing fails, the lock is left to expire with the session. Followers just deregister. Give the task a kill timeout of
    at least 10s.
    A non-leader whose instance comes back after a restart or a failed fence
    is fenced within ~250ms; booting kvrocks with `replicaof <fence-host>
@@ -108,7 +111,8 @@ kvrocks-leader --kv-kind=redis --kvrocks-port 6379 --cluster main ...
 ```
 
 (`--kv-kind=redis`, `$KV_KIND=redis`.) The only backend-specific step is
-`CONFIG SET use-rsid-psync yes`, which is skipped for `redis` since Redis
+`CONFIG SET use-rsid-psync yes` (retried once the instance first answers,
+unsupported on newer kvrocks and then ignored), which is skipped for `redis` since Redis
 has no such setting. Everything else — `PING`, `INFO replication` lag
 parsing (Redis reliably reports `slave_repl_offset`, so the lag gate is
 exact rather than unknown), `REPLICAOF` (≥ Redis 5, `SLAVEOF` fallback

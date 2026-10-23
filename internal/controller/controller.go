@@ -6,9 +6,11 @@ import (
 	"errors"
 	"math"
 	"math/rand"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/example/kvrocks-leader/internal/config"
@@ -51,6 +53,7 @@ type Controller struct {
 	// fencePending is set when a fence attempt failed; the return watcher
 	// retries as soon as the instance answers.
 	fencePending   bool
+	rsidDone       bool // use-rsid-psync applied (or not applicable)
 	lastLeaderSeen time.Time
 	// lastRenewOK is the last time Consul confirmed our session (create or
 	// renew). The leader tolerates Consul errors until ~SessionTTL past it.
@@ -147,13 +150,9 @@ func (c *Controller) serviceID() string { return c.cfg.ServiceName + "-" + c.cfg
 func (c *Controller) Run(ctx context.Context) {
 	c.log.Info("starting", map[string]any{"mode": c.cfg.Mode, "key": c.cfg.LeaderKey()})
 	// Best effort: ensure partial-sync friendly config.
-	func() {
-		tctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
-		defer cancel()
-		if err := c.deps.KV.EnsureRsIDPsync(tctx); err != nil {
-			c.log.Warn("ensure use-rsid-psync failed (non-fatal)", map[string]any{"error": err.Error()})
-		}
-	}()
+	// kvrocks is often not listening yet when the sidecar starts; then this
+	// is retried when the backend first answers (onBackendBack).
+	c.ensureRsIDPsync(ctx)
 
 	// Session management + health + election in one tick loop for simplicity
 	// and testability; watch loop runs separately for followers.
@@ -851,9 +850,18 @@ func (c *Controller) shutdown(ctx context.Context) {
 	_ = c.deps.Registrar.Deregister(sctx, c.serviceID())
 	// Never leave a writable master behind: fence before the lock goes, so
 	// the next leader can never overlap with us.
-	fenced := c.fenceForShutdown(sctx)
+	fenced, gone := c.fenceForShutdown(sctx)
 	if wasLeader {
 		c.reg.StepDowns.WithLabelValues(metrics.ReasonShutdown).Inc()
+		if gone {
+			// Nothing is serving on the local address (it was stopped first,
+			// e.g. on alloc stop). It cannot take writes, and it boots fenced
+			// (replicaof in its config), so hand the lock over now instead of
+			// leaving the cluster leaderless for TTL + lock-delay.
+			c.log.Info("local kvrocks is gone; releasing the lock without fencing", nil)
+			c.releaseSession(sctx)
+			return
+		}
 		if !fenced {
 			// Releasing now could create two masters. Leave the session to
 			// expire; lock-delay then holds off the next leader a little
@@ -877,24 +885,31 @@ func (c *Controller) shutdown(ctx context.Context) {
 // sidecar exits, retrying briefly. It reports whether the instance is now
 // confirmed fenced (or already was). Clients are dropped after fencing so
 // they reconnect to whoever is master next.
-func (c *Controller) fenceForShutdown(ctx context.Context) bool {
+func (c *Controller) fenceForShutdown(ctx context.Context) (fenced, gone bool) {
+	probe := minDur(c.cfg.KvrocksTimeout, time.Second)
+	gone = true
 	for attempt := 0; ; attempt++ {
-		pctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+		pctx, cancel := context.WithTimeout(ctx, probe)
 		ri, err := c.deps.KV.InfoReplication(pctx)
 		cancel()
 		if err == nil && ri.Role == "slave" {
-			return true
+			return true, false
 		}
 		if err == nil && c.fence(ctx, nil) {
 			c.killClients(ctx)
-			return true
+			return true, false
+		}
+		// gone only if every attempt found nothing answering; an instance
+		// that answers but refuses REPLICAOF keeps the lock.
+		if err == nil || !backendGone(err) {
+			gone = false
 		}
 		if attempt >= 2 {
-			return false
+			return false, gone
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return false, gone
 		case <-time.After(300 * time.Millisecond):
 		}
 	}
@@ -944,6 +959,9 @@ func (c *Controller) backendReturnWatch(ctx context.Context) {
 // again. A non-leader that finds it writable fences immediately, then a
 // normal tick follows.
 func (c *Controller) onBackendBack(ctx context.Context) {
+	if !c.rsidDone {
+		c.ensureRsIDPsync(ctx)
+	}
 	if c.cfg.Mode != "observe" && !c.isLeader() {
 		pctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
 		ri, err := c.deps.KV.InfoReplication(pctx)
@@ -959,6 +977,36 @@ func (c *Controller) onBackendBack(ctx context.Context) {
 		}
 	}
 	c.tick(ctx)
+}
+
+// ensureRsIDPsync applies use-rsid-psync once (best effort). If the local
+// instance is not reachable yet it stays pending without a warning.
+func (c *Controller) ensureRsIDPsync(ctx context.Context) {
+	tctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+	defer cancel()
+	err := c.deps.KV.EnsureRsIDPsync(tctx)
+	switch {
+	case err == nil:
+		c.rsidDone = true
+	case backendGone(err):
+		// Not listening yet; retried when the backend first answers.
+	default:
+		c.rsidDone = true
+		c.log.Warn("ensure use-rsid-psync failed (non-fatal)", map[string]any{"error": err.Error()})
+	}
+}
+
+// backendGone reports whether err means nothing is answering on the local
+// address: connection refused, or no answer within the timeout.
+func backendGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func minDur(a, b time.Duration) time.Duration {
