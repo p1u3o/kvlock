@@ -15,7 +15,7 @@ services:
       retries: 30
 
   kvrocks-a:
-    image: apache/kvrocks:2.7.0
+    image: apache/kvrocks:2.11.0
     command: ["--bind", "0.0.0.0", "--port", "8379", "--daemonize", "no", "--use-rsid-psync", "yes", "--requirepass", ""]
     ports:
       - "18379:8379"
@@ -24,7 +24,7 @@ services:
         condition: service_healthy
 
   kvrocks-b:
-    image: apache/kvrocks:2.7.0
+    image: apache/kvrocks:2.11.0
     command: ["--bind", "0.0.0.0", "--port", "8379", "--daemonize", "no", "--use-rsid-psync", "yes", "--requirepass", ""]
     ports:
       - "18380:8379"

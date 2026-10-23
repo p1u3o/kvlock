@@ -1,29 +1,35 @@
-# Least-privilege Consul ACL for kvrocks-leader sidecars.
-# Install: consul acl policy create -name kvrocks-leader -rules @deploy/consul-policy.hcl
-# Token per node (kv01/kv02) with node_identity or legacy node write below.
+# Consul ACL policy for ONE kvrocks-leader sidecar (this example: node kv01).
+# Create one policy + token per node, replacing "kv01" with that node's
+# Consul node name (kv02 for the other one):
+#
+#   sed 's/kv01/kv02/g' deploy/consul-policy.hcl > /tmp/kv02.hcl
+#   consul acl policy create -name kvrocks-leader-kv01 -rules @deploy/consul-policy.hcl
+#   consul acl token create -policy-name kvrocks-leader-kv01 -description "kvrocks-leader kv01"
+#
+# Assumes --cluster=main and --service-name=kvrocks. Adjust the key prefix
+# and service names if you change those.
 
-# Sessions: create/renew/destroy sessions bound to this node.
-session_prefix "" {
-  policy = "write"
-}
-# Equivalent scoped form (preferred on Consul >= 1.11 with node identities):
-# session "kv01" { policy = "write" }
-
-# Leader lock (active) plus observe prefix used in --mode=observe.
-key_prefix "kvrocks/" {
-  policy = "write"
-}
-
-# Service catalog: register kvrocks with master/replica tags + TTL checks,
-# read the service for discovery.
-service_prefix "kvrocks" {
+# Leader lock (kvrocks/main/leader) and the observe-mode key
+# (kvrocks/main/observe/leader). Nothing else in the KV store.
+key_prefix "kvrocks/main/" {
   policy = "write"
 }
 
-# Required to register checks tied to the agent.
-agent_prefix "" {
+# Sessions may only be created on this node.
+session "kv01" {
   policy = "write"
 }
-node_prefix "" {
+
+# Catalog entries the sidecar registers via its local agent (with their TTL
+# checks). "kvrocks-private" is only needed with --advertise-addr-private.
+service "kvrocks" {
+  policy = "write"
+}
+service "kvrocks-private" {
+  policy = "write"
+}
+
+# Registering a service on the local agent needs read on that node.
+node "kv01" {
   policy = "read"
 }

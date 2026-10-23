@@ -1,117 +1,154 @@
-# Example Nomad group: kvrocks + kvrocks-leader sidecar.
-# Host networking; Consul token via Vault (or workload identity); kvrocks
-# password via Vault template. Failover does NOT depend on Nomad service
-# checks — the sidecar keeps its own Consul TTL check fresh.
+# Example Nomad job: kvrocks 2.11 + kvrocks-leader sidecar on two hosts.
+#
+# One group per host (kv01, kv02) so each kvrocks/sidecar pair is pinned to
+# its own machine and they can never land together. Host networking with
+# static ports: kvrocks 6666, sidecar HTTP 8080 (bound to the host IP so
+# Nomad's check and Prometheus can reach it).
+#
+# Secrets come from Vault templates into secrets/. The kvrocks task gets
+# only the kvrocks password; only the sidecar gets the Consul token.
+# Failover does not depend on Nomad checks: the sidecar keeps its own Consul
+# TTL check fresh.
+
+variable "sidecar_image" {
+  type        = string
+  description = "kvrocks-leader image built from this repo's Dockerfile, pinned by tag or digest"
+  # No default on purpose: set it with -var sidecar_image=...
+}
+
+variable "kvrocks_image" {
+  type    = string
+  default = "apache/kvrocks:2.11.0"
+}
+
+locals {
+  nodes = ["kv01", "kv02"]
+}
+
 job "kvrocks" {
   datacenters = ["dc1"]
   type        = "service"
 
-  group "kvrocks-pair" {
-    network {
-      mode = "host"
-    }
+  dynamic "group" {
+    for_each = local.nodes
+    labels   = [group.value]
 
-    # ---- kvrocks ----
-    task "kvrocks" {
-      driver = "docker"
+    content {
+      count = 1
 
-      config {
-        image = "apache/kvrocks:2.7.0"
-        args = [
-          "/kvrocks/kvrocks.conf",
-          "--bind", "0.0.0.0",
-          "--port", "6666",
-          "--daemonize", "no",
-          # Partial resync on failover. Also enforced at runtime by the sidecar.
-          "--use-rsid-psync", "yes",
-        ]
-        network_mode = "host"
+      constraint {
+        attribute = "${node.unique.name}"
+        value     = group.value
       }
 
-      env {
-        # Kvrocks port; sidecar defaults match.
-        KVROCKS_PORT = "6666"
+      network {
+        mode = "host"
+        port "kvrocks" {
+          static = 6666
+        }
+        port "http" {
+          static = 8080
+        }
       }
 
-      template {
-        # Vault-provided password shared by kvrocks + sidecar.
-        data        = <<EOH
+      task "kvrocks" {
+        driver = "docker"
+
+        config {
+          image        = var.kvrocks_image
+          network_mode = "host"
+          ports        = ["kvrocks"]
+          # Replace the image's default config path with ours; keep its
+          # data dir so the volume below holds the data.
+          entrypoint = ["kvrocks"]
+          args = [
+            "-c", "/secrets/kvrocks.conf",
+            "--dir", "/var/lib/kvrocks",
+          ]
+          volumes = ["/srv/kvrocks:/var/lib/kvrocks"]
+        }
+
+        template {
+          data        = <<EOH
+bind {{ env "NOMAD_IP_kvrocks" }} 127.0.0.1
+port {{ env "NOMAD_PORT_kvrocks" }}
+daemonize no
+# Partial resync after failover.
+use-rsid-psync yes
+slave-read-only yes
 requirepass {{ with secret "kv/data/kvrocks" }}{{ .Data.data.password }}{{ end }}
+masterauth {{ with secret "kv/data/kvrocks" }}{{ .Data.data.password }}{{ end }}
 EOH
-        destination = "secrets/kvrocks.conf.include"
-        change_mode = "restart"
+          destination = "secrets/kvrocks.conf"
+          perms       = "0600"
+          change_mode = "restart"
+        }
+
+        resources {
+          cpu    = 1000
+          memory = 1024
+        }
       }
 
-      template {
-        data        = <<EOH
-CONSUL_HTTP_TOKEN={{ with secret "kv/data/consul/kvrocks-leader" }}{{ .Data.data.token }}{{ end }}
-EOH
-        destination = "secrets/consul.env"
-        env         = true
-        change_mode = "restart"
-      }
+      task "kvrocks-leader" {
+        driver = "docker"
 
-      resources {
-        cpu    = 1000
-        memory = 1024
-      }
-    }
+        lifecycle {
+          hook    = "prestart"
+          sidecar = true
+        }
 
-    # ---- sidecar ----
-    task "kvrocks-leader" {
-      driver = "docker"
+        config {
+          image        = var.sidecar_image
+          network_mode = "host"
+          ports        = ["http"]
+          args = [
+            "--consul-addr", "127.0.0.1:8500",
+            "--kvrocks-addr", "127.0.0.1",
+            "--kvrocks-port", "${NOMAD_PORT_kvrocks}",
+            "--node", "${node.unique.name}",
+            "--advertise-addr", "${NOMAD_IP_kvrocks}",
+            # Optional NetBird address. Set client meta "netbird_ip" on both
+            # hosts, then uncomment (an unset meta is NOT interpolated away).
+            # "--advertise-addr-private", "${meta.netbird_ip}",
+            "--advertise-port", "${NOMAD_PORT_kvrocks}",
+            "--cluster", "main",
+            "--service-name", "kvrocks",
+            "--http-addr", "${NOMAD_ADDR_http}",
+          ]
+        }
 
-      lifecycle {
-        hook    = "prestart"
-        sidecar = true
-      }
-
-      config {
-        # Built by Dockerfile in this repo.
-        image        = "registry.example.com/kvrocks-leader:latest"
-        network_mode = "host"
-        args = [
-          "--consul-addr", "${NOMAD_IP_kvrocks}:8500",
-          "--kvrocks-addr", "127.0.0.1",
-          "--kvrocks-port", "6666",
-          "--node", "${node.unique.name}",
-          "--advertise-addr", "${NOMAD_IP_kvrocks}",
-          "--advertise-port", "6666",
-          "--cluster", "main",
-          "--service-name", "kvrocks",
-          "--http-addr", "127.0.0.1:8080",
-        ]
-      }
-
-      template {
-        data        = <<EOH
+        template {
+          data        = <<EOH
 KVROCKS_PASSWORD={{ with secret "kv/data/kvrocks" }}{{ .Data.data.password }}{{ end }}
-CONSUL_HTTP_TOKEN={{ with secret "kv/data/consul/kvrocks-leader" }}{{ .Data.data.token }}{{ end }}
+CONSUL_HTTP_TOKEN={{ with secret (printf "kv/data/consul/kvrocks-leader-%s" (env "node.unique.name")) }}{{ .Data.data.token }}{{ end }}
 EOH
-        destination = "secrets/sidecar.env"
-        env         = true
-        change_mode = "restart"
+          destination = "secrets/sidecar.env"
+          env         = true
+          perms       = "0600"
+          change_mode = "restart"
+        }
+
+        resources {
+          cpu    = 200
+          memory = 128
+        }
       }
 
-      resources {
-        cpu    = 200
-        memory = 128
-      }
-    }
-
-    # Clients discover the master through Consul DNS / catalog, e.g.
-    # master.kvrocks.service.consul filtered by tag "master",
-    # NOT through a Nomad service check.
-    service {
-      name = "kvrocks-sidecar"
-      port = "8080"
-      tags = ["http", "metrics"]
-      check {
-        name     = "sidecar-http"
-        type     = "http"
-        path     = "/healthz"
-        interval = "30s"
-        timeout  = "5s"
+      # Sidecar health for Nomad/ops visibility only. Clients find the
+      # master via Consul (tag "master" on service "kvrocks"), not this.
+      service {
+        name     = "kvrocks-sidecar"
+        port     = "http"
+        tags     = ["http", "metrics", group.value]
+        provider = "consul"
+        check {
+          name     = "sidecar-healthz"
+          type     = "http"
+          path     = "/healthz"
+          interval = "10s"
+          timeout  = "3s"
+        }
       }
     }
   }
