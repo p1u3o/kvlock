@@ -62,6 +62,18 @@ type Config struct {
 
 	HTTPAddr string
 
+	// AdminToken guards admin endpoints (POST /handover). When empty they
+	// only accept connections from loopback addresses.
+	AdminToken     string
+	AdminTokenFile string
+	// HandoverTimeout bounds how long a planned handover waits for a
+	// replica to catch up; it is also how long the handover hint reserves
+	// the lock for the chosen replica.
+	HandoverTimeout time.Duration
+	// HandoverMaxLag is the lag bound for a planned handover; < 0 means
+	// use MaxLagBytes.
+	HandoverMaxLag int64
+
 	CheckInterval time.Duration
 }
 
@@ -156,6 +168,10 @@ func Parse(args []string) (*Config, error) {
 	fs.BoolVar(&c.KillClientsOnDemote, "kill-clients-on-demote", getenvBool("KILL_CLIENTS_ON_DEMOTE", true), "After fencing a demoted master, CLIENT KILL TYPE normal so clients reconnect ($KILL_CLIENTS_ON_DEMOTE)")
 
 	fs.StringVar(&c.HTTPAddr, "http-addr", getenv("HTTP_ADDR", ":8080"), "Health/metrics listen address ($HTTP_ADDR)")
+	fs.StringVar(&c.AdminToken, "admin-token", getenv("KVLOCK_ADMIN_TOKEN", ""), "Bearer token for admin endpoints; empty = loopback clients only ($KVLOCK_ADMIN_TOKEN)")
+	fs.StringVar(&c.AdminTokenFile, "admin-token-file", getenv("KVLOCK_ADMIN_TOKEN_FILE", ""), "File containing the admin token ($KVLOCK_ADMIN_TOKEN_FILE)")
+	fs.DurationVar(&c.HandoverTimeout, "handover-timeout", getenvDur("HANDOVER_TIMEOUT", 30*time.Second), "Planned handover: max wait for a replica to catch up ($HANDOVER_TIMEOUT)")
+	fs.Int64Var(&c.HandoverMaxLag, "handover-max-lag", getenvInt64("HANDOVER_MAX_LAG", -1), "Planned handover lag bound; -1 = --max-lag-bytes ($HANDOVER_MAX_LAG)")
 	fs.DurationVar(&c.CheckInterval, "check-interval", getenvDur("CHECK_INTERVAL", 3*time.Second), "kvrocks health check interval ($CHECK_INTERVAL)")
 
 	if err := fs.Parse(args); err != nil {
@@ -169,6 +185,13 @@ func Parse(args []string) (*Config, error) {
 			return nil, fmt.Errorf("read consul token file: %w", err)
 		}
 		c.ConsulToken = string(bytesTrim(b))
+	}
+	if c.AdminTokenFile != "" {
+		b, err := os.ReadFile(c.AdminTokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("read admin token file: %w", err)
+		}
+		c.AdminToken = string(bytesTrim(b))
 	}
 	if c.KvrocksPasswordFile != "" {
 		b, err := os.ReadFile(c.KvrocksPasswordFile)
@@ -198,6 +221,12 @@ func Parse(args []string) (*Config, error) {
 	}
 	if c.FencePort == c.KvrocksPort && (c.FenceHost == c.KvrocksAddr || c.FenceHost == "127.0.0.1" || c.FenceHost == "localhost") {
 		return nil, fmt.Errorf("--fence-host/--fence-port must not point at the local instance")
+	}
+	if c.HandoverMaxLag < 0 {
+		c.HandoverMaxLag = c.MaxLagBytes
+	}
+	if c.HandoverTimeout <= 0 {
+		return nil, fmt.Errorf("invalid --handover-timeout %v", c.HandoverTimeout)
 	}
 	if c.SessionTTL < 5*time.Second {
 		return nil, fmt.Errorf("session TTL %v too short: minimum 5s", c.SessionTTL)

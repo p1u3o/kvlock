@@ -65,6 +65,9 @@ type ReplicaState struct {
 	IP     string
 	Port   int
 	Offset int64
+	// State is Redis' state= field ("online", "wait_bgsave", ...); kvrocks
+	// does not report one and leaves it empty.
+	State string
 }
 
 // Client is the sidecar's view of the local kvrocks.
@@ -408,6 +411,8 @@ func parseSlaveLine(v string) (ReplicaState, bool) {
 			rs.IP = val
 		case "port":
 			rs.Port, _ = strconv.Atoi(val)
+		case "state":
+			rs.State = val
 		case "offset":
 			if n, good := parseInt(val); good {
 				rs.Offset = n

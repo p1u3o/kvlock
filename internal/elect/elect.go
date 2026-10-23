@@ -6,9 +6,12 @@ package elect
 import (
 	"encoding/json"
 	"math/rand"
+	"net"
+	"strconv"
 	"time"
 
 	"github.com/example/kvrocks-leader/internal/consulstore"
+	"github.com/example/kvrocks-leader/internal/kvrocks"
 )
 
 // Role is the sidecar's current role.
@@ -174,4 +177,68 @@ func HealthProblems(role Role, backendRole string, backendUp, consulOK, observe 
 		p = append(p, "role not yet determined")
 	}
 	return p
+}
+
+// HandoverActive reports whether lv carries a planned-handover hint that
+// has not yet expired.
+func HandoverActive(lv *consulstore.LeaderValue, now time.Time) bool {
+	if lv == nil || lv.HandoverTo == "" || lv.HandoverUntil == "" {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339Nano, lv.HandoverUntil)
+	return err == nil && now.Before(until)
+}
+
+// IsHandoverTarget reports whether "ip:port" target names this node, given
+// the addresses it is known by and its port.
+func IsHandoverTarget(target string, addrs []string, port int) bool {
+	host, p, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	if n, err := strconv.Atoi(p); err != nil || n != port {
+		return false
+	}
+	for _, a := range addrs {
+		if a != "" && a == host {
+			return true
+		}
+	}
+	return false
+}
+
+// HandoverCandidate is a replica that could take over, with its lag.
+type HandoverCandidate struct {
+	Addr string // ip:port as reported by the master
+	Lag  int64
+}
+
+// PickHandoverTarget chooses the replica to hand over to from the leader's
+// own INFO replication: the least-lagged replica that is online (when the
+// server reports a state) and, if want is set, whose ip:port equals want.
+// ok is false when there is no usable replica at all; the caller compares
+// Lag against its bound.
+func PickHandoverTarget(ri *kvrocks.ReplicationInfo, want string) (HandoverCandidate, bool) {
+	var best HandoverCandidate
+	found := false
+	if ri == nil || ri.Role != "master" || ri.MasterOffset < 0 {
+		return best, false
+	}
+	for _, r := range ri.Replicas {
+		if r.IP == "" || r.Port <= 0 || (r.State != "" && r.State != "online") {
+			continue
+		}
+		addr := net.JoinHostPort(r.IP, strconv.Itoa(r.Port))
+		if want != "" && addr != want {
+			continue
+		}
+		lag := ri.MasterOffset - r.Offset
+		if lag < 0 {
+			lag = 0
+		}
+		if !found || lag < best.Lag {
+			best, found = HandoverCandidate{Addr: addr, Lag: lag}, true
+		}
+	}
+	return best, found
 }

@@ -32,8 +32,13 @@ type Provider interface {
 }
 
 // Server wires /healthz /status /metrics.
-func Handler(p Provider) http.Handler {
+//
+// With an Admin whose Handover is set it also serves POST /handover.
+func Handler(p Provider, admin ...Admin) http.Handler {
 	mux := http.NewServeMux()
+	if len(admin) > 0 && admin[0].Handover != nil {
+		mux.HandleFunc("/handover", admin[0].handleHandover)
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		snap := p.Snapshot()
 		w.Header().Set("Content-Type", "application/json")

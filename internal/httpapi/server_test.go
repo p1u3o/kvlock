@@ -39,7 +39,10 @@ func TestEndpoints(t *testing.T) {
 			t.Fatalf("%s -> %d", path, resp.StatusCode)
 		}
 	}
-	resp, _ := srv.Client().Get(srv.URL + "/status")
+	resp, err := srv.Client().Get(srv.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resp.Body.Close()
 	var snap httpapi.Snapshot
 	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {

@@ -18,6 +18,9 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "handover" {
+		os.Exit(runHandover(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	cfg, err := config.Parse(os.Args[1:])
 	if err != nil {
 		os.Stderr.WriteString("config error: " + err.Error() + "\n")
@@ -45,8 +48,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// HTTP: /healthz /status /metrics. Independent of Nomad checks by design.
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.Handler(c), ReadHeaderTimeout: 5 * time.Second}
+	// HTTP: /healthz /status /metrics /handover. Independent of Nomad checks by design.
+	admin := httpapi.Admin{Token: cfg.AdminToken, Handover: c}
+	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.Handler(c, admin), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		log.Info("http listening", map[string]any{"addr": cfg.HTTPAddr})
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

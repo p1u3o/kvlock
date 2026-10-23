@@ -2,6 +2,7 @@ package controller_test
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
@@ -162,6 +163,7 @@ type fakeKV struct {
 
 	kills             int
 	killedWhileMaster bool
+	replicas          []kvrocks.ReplicaState
 }
 
 func (f *fakeKV) Ping(ctx context.Context) error {
@@ -178,7 +180,12 @@ func (f *fakeKV) InfoReplication(ctx context.Context) (*kvrocks.ReplicationInfo,
 	if !f.up {
 		return nil, errString("down")
 	}
-	return &kvrocks.ReplicationInfo{Role: f.role, MasterHost: f.masterHost, MasterPort: f.masterPort, LagBytes: f.lag, LocalOffset: f.local, MasterLinkUp: true}, nil
+	ri := &kvrocks.ReplicationInfo{Role: f.role, MasterHost: f.masterHost, MasterPort: f.masterPort, LagBytes: f.lag, LocalOffset: f.local, MasterOffset: -1, MasterLinkUp: true}
+	if f.role == "master" {
+		ri.MasterOffset = f.local
+		ri.Replicas = append([]kvrocks.ReplicaState(nil), f.replicas...)
+	}
+	return ri, nil
 }
 func (f *fakeKV) PeerInfoReplication(ctx context.Context, h string, p int) (*kvrocks.ReplicationInfo, error) {
 	f.mu.Lock()
@@ -239,6 +246,7 @@ func testConfig(node string) *config.Config {
 		ReelectBaseBackoff: time.Millisecond, ReelectMaxBackoff: 5 * time.Millisecond,
 		HTTPAddr: ":0", CheckInterval: 20 * time.Millisecond,
 		KillClientsOnDemote: true,
+		HandoverTimeout:     2 * time.Second, HandoverMaxLag: 1000,
 	}
 }
 
@@ -563,4 +571,12 @@ func TestDemotionKillsClientsAfterFencing(t *testing.T) {
 			t.Fatalf("disabled: kills=%d, want 0", kills)
 		}
 	}
+}
+
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }

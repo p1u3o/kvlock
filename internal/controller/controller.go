@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/kvrocks-leader/internal/config"
@@ -60,11 +61,15 @@ type Controller struct {
 	peerSession string
 
 	rng *rand.Rand
+
+	// cmds runs functions inside the control loop (planned handover).
+	cmds         chan func(context.Context)
+	handoverBusy atomic.Bool
 }
 
 // New builds a controller.
 func New(cfg *config.Config, deps Deps, log *logx.Logger, reg *metrics.Registry) *Controller {
-	c := &Controller{cfg: cfg, deps: deps, log: log, reg: reg, role: elect.RoleUnknown, lag: -1, peerOffset: -1, rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
+	c := &Controller{cfg: cfg, deps: deps, log: log, reg: reg, role: elect.RoleUnknown, lag: -1, peerOffset: -1, rng: rand.New(rand.NewSource(time.Now().UnixNano())), cmds: make(chan func(context.Context))}
 	reg.SetRenewAgeFunc(func() float64 {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
@@ -144,6 +149,8 @@ func (c *Controller) Run(ctx context.Context) {
 		case <-ctx.Done():
 			c.shutdown(context.Background())
 			return
+		case f := <-c.cmds:
+			f(ctx)
 		case <-ttlTicker.C:
 			c.renewSession(ctx)
 		case <-ticker.C:
@@ -373,6 +380,9 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 		c.mu.Unlock()
 		if c.isLeader() {
 			c.demote(ctx, metrics.ReasonLockLost, "lock no longer held", nil)
+		}
+		if elect.HandoverActive(lv, time.Now()) && c.onHandoverHint(ctx, ri, lv) {
+			return
 		}
 		// Keep the last sample from the departed leader: that is exactly
 		// what the lag gate needs now.

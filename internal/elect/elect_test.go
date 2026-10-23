@@ -1,6 +1,8 @@
 package elect_test
 
 import (
+	"github.com/example/kvrocks-leader/internal/consulstore"
+	"github.com/example/kvrocks-leader/internal/kvrocks"
 	"math/rand"
 	"testing"
 	"time"
@@ -152,5 +154,50 @@ func TestHealthProblems(t *testing.T) {
 	}
 	if p := elect.HealthProblems(elect.RoleFollower, "master", true, true, true); len(p) != 0 {
 		t.Fatalf("observe mode skips role check: %v", p)
+	}
+}
+
+func TestHandoverActive(t *testing.T) {
+	now := time.Now()
+	lv := &consulstore.LeaderValue{HandoverTo: "10.0.0.2:6666", HandoverUntil: now.Add(time.Second).Format(time.RFC3339Nano)}
+	if !elect.HandoverActive(lv, now) {
+		t.Fatal("should be active")
+	}
+	if elect.HandoverActive(lv, now.Add(2*time.Second)) || elect.HandoverActive(nil, now) || elect.HandoverActive(&consulstore.LeaderValue{HandoverTo: "x:1", HandoverUntil: "garbage"}, now) {
+		t.Fatal("expired/nil/bad hints are inactive")
+	}
+}
+
+func TestIsHandoverTarget(t *testing.T) {
+	addrs := []string{"", "10.0.0.2", "192.168.1.2"}
+	if !elect.IsHandoverTarget("192.168.1.2:6666", addrs, 6666) {
+		t.Fatal("should match")
+	}
+	for _, tgt := range []string{"10.0.0.2:6667", "10.0.0.3:6666", "junk", ":6666"} {
+		if elect.IsHandoverTarget(tgt, addrs, 6666) {
+			t.Fatalf("%q must not match", tgt)
+		}
+	}
+}
+
+func TestPickHandoverTarget(t *testing.T) {
+	ri := &kvrocks.ReplicationInfo{Role: "master", MasterOffset: 1000, Replicas: []kvrocks.ReplicaState{
+		{IP: "10.0.0.2", Port: 6666, Offset: 900, State: "online"},
+		{IP: "10.0.0.3", Port: 6666, Offset: 990},
+		{IP: "10.0.0.4", Port: 6666, Offset: 1000, State: "wait_bgsave"},
+	}}
+	c, ok := elect.PickHandoverTarget(ri, "")
+	if !ok || c.Addr != "10.0.0.3:6666" || c.Lag != 10 {
+		t.Fatalf("got %+v %v", c, ok)
+	}
+	c, ok = elect.PickHandoverTarget(ri, "10.0.0.2:6666")
+	if !ok || c.Lag != 100 {
+		t.Fatalf("got %+v %v", c, ok)
+	}
+	if _, ok := elect.PickHandoverTarget(ri, "10.0.0.4:6666"); ok {
+		t.Fatal("replica not online must be skipped")
+	}
+	if _, ok := elect.PickHandoverTarget(&kvrocks.ReplicationInfo{Role: "slave"}, ""); ok {
+		t.Fatal("not a master")
 	}
 }

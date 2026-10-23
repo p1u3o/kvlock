@@ -23,6 +23,15 @@ type LeaderValue struct {
 	Session     string `json:"session"`
 	Since       string `json:"since"`
 	Epoch       uint64 `json:"epoch"`
+
+	// Planned handover hint, written by the leader just before it releases
+	// the lock. Until HandoverUntil (RFC 3339) only the replica at
+	// HandoverTo ("ip:port") may acquire, and only once its replication
+	// offset is within the lag bound of HandoverOffset, the old leader's
+	// final offset after it was fenced.
+	HandoverTo     string `json:"handover_to,omitempty"`
+	HandoverUntil  string `json:"handover_until,omitempty"`
+	HandoverOffset int64  `json:"handover_offset,omitempty"`
 }
 
 // Session handles Consul session lifecycle.
