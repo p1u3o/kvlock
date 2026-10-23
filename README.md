@@ -109,6 +109,27 @@ because its kvrocks stopped answering before its session went away, a lag
 that looks within bound counts as unknown and the hold-down applies. A lag
 already over the bound stays a refusal.
 
+**Time-based gate (v0.2)**: the offset gate counts writes, not time. A burst
+of small writes refuses a replica that is only milliseconds behind, and on a
+quiet cluster a replica that stopped replicating minutes ago still looks
+current. So the leader also writes a heartbeat key, `kvlock:hb:<cluster>`
+(value `<unix ms>:<epoch>`), every `--heartbeat-interval` (default 250ms,
+0 = off). Followers read it from the leader's kvrocks and from their own
+copy; the lag is the difference of the two values. Both were stamped by the
+leader's clock, so clock skew between nodes does not matter, and a leader
+that just died does not inflate the lag (unlike "now minus heartbeat").
+
+At promotion, when a heartbeat of the departed leader was sampled, the time
+gate decides: allowed when lag <= `--max-lag-time` (default 2s), otherwise it
+refuses like the offset gate (hold-down, sample age and
+`--lag-gate-max-wait` apply the same way). A replica that has no copy of a
+heartbeat the leader had counts as far behind. When no leader heartbeat was
+ever seen (first start, heartbeats disabled, a v0.1 leader) the offset gate
+above is used. `/status` shows which gate would apply (`lag_gate`).
+
+Observe mode never writes the heartbeat; it only reads an existing key.
+Clients behind the proxy can see the key; it is tiny and rewritten in place.
+
 A replica over `--max-lag` refuses until the old leader comes back, or until
 it has been gone for `--lag-gate-max-wait` (default 5m). After that it promotes
 anyway, and the writes the old leader never replicated are lost. Set it to 0
@@ -197,25 +218,46 @@ tag `master` (or your `--service-name`/`--master-tag`).
 ## Metrics
 
 `GET /metrics` is a standard Prometheus endpoint (client_golang, private
-registry, plus Go/process collectors). Names are unprefixed so existing
-dashboards keep working:
+registry, plus Go/process collectors).
+
+**v0.2 rename:** every sidecar metric now starts with `kvlock_` (for example
+`is_leader` is `kvlock_is_leader`, `step_downs_total` is
+`kvlock_step_downs_total`). Labels are unchanged; update dashboards and
+alerts by adding the prefix. Go/process collector names are unchanged.
 
 | metric | type | labels |
 |---|---|---|
-| `is_leader`, `kvrocks_up` | gauge | |
-| `replication_lag_bytes` | gauge (-1 = unknown) | |
-| `lock_held_seconds`, `consul_last_renew_age_seconds` | gauge | |
-| `elections_total`, `leader_acquired_total`, `leader_changes_total` | counter | |
-| `step_downs_total` | counter | `reason` = backend_unhealthy, session_invalidated, consul_unreachable, lock_lost, lock_taken, handover, shutdown |
-| `fencing_events_total` | counter | `target` = leader\|fence, `result` = ok\|error |
-| `consul_errors_total` | counter | `op` = session\|renew\|lock |
-| `client_kill_runs_total` (`result`), `clients_killed_total` | counter | |
-| `handovers_total` | counter | `result` = ok\|aborted\|no_successor |
-| `proxy_active_connections` | gauge | `listener` = write\|read |
-| `proxy_dropped_connections_total`, `proxy_refused_connections_total` | counter | `listener` |
+| `kvlock_is_leader`, `kvlock_kvrocks_up` | gauge | |
+| `kvlock_replication_lag_bytes` | gauge (-1 = unknown) | offset lag (sequence numbers with kvrocks) |
+| `kvlock_replication_lag_seconds` | gauge (-1 = unknown) | heartbeat lag, 0 on the leader |
+| `kvlock_heartbeat_age_seconds` | gauge (-1 = none) | local clock minus newest local heartbeat (includes clock skew) |
+| `kvlock_heartbeat_writes_total` | counter | `result` = ok\|error |
+| `kvlock_lag_gate_refusals_total` | counter | |
+| `kvlock_lock_held_seconds`, `kvlock_consul_last_renew_age_seconds` | gauge | |
+| `kvlock_elections_total`, `kvlock_leader_acquired_total`, `kvlock_leader_changes_total` | counter | |
+| `kvlock_step_downs_total` | counter | `reason` = backend_unhealthy, session_invalidated, consul_unreachable, lock_lost, lock_taken, handover, shutdown |
+| `kvlock_fencing_events_total` | counter | `target` = leader\|fence, `result` = ok\|error |
+| `kvlock_consul_errors_total` | counter | `op` = session\|renew\|lock |
+| `kvlock_client_kill_runs_total` (`result`), `kvlock_clients_killed_total` | counter | |
+| `kvlock_handovers_total` | counter | `result` = ok\|aborted\|no_successor |
+| `kvlock_proxy_active_connections` | gauge | `listener` = write\|read |
+| `kvlock_proxy_dropped_connections_total`, `kvlock_proxy_refused_connections_total` | counter | `listener` |
 
 `fence_failures_total` from v0.1 is replaced by
-`fencing_events_total{result="error"}`.
+`kvlock_fencing_events_total{result="error"}`.
+
+## Status page
+
+`GET /` (or `/ui`) on the HTTP port serves a small self-contained page
+(embedded, no external assets, strict CSP) that polls `/status` every 2s:
+cluster, mode, role, leader/epoch/lock age, addresses, replication link and
+lag (time and offset), Consul renew age, health, fencing state, proxy and
+sentinel connection counts, and the last 50 events (elections, follows,
+step-downs, fences, handovers, lag-gate refusals). Everything is rendered as
+text. The page is read-only; a handover button appears only after an admin
+token is typed into the page, and it is sent as `Authorization: Bearer` to
+`POST /handover`. `/status` itself has no secrets but exposes topology, so
+keep the port on a private network.
 
 ## Client connections on demotion
 

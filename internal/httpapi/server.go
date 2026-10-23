@@ -23,6 +23,44 @@ type Snapshot struct {
 	BackendRole     string     `json:"backend_role,omitempty"`
 	Healthy         bool       `json:"healthy"`
 	Problems        []string   `json:"problems,omitempty"`
+
+	// Added in v0.2.0 for the status page.
+	Version     string `json:"version,omitempty"`
+	Cluster     string `json:"cluster"`
+	Node        string `json:"node"`
+	NodeAddr    string `json:"node_addr"`
+	LeaderSince string `json:"leader_since,omitempty"`
+	// LeaderAgeSeconds is how long the current holder has held the lock.
+	LeaderAgeSeconds float64 `json:"leader_age_seconds"`
+	// LagSeconds is the heartbeat lag (-1 unknown, 0 on the leader).
+	LagSeconds float64 `json:"lag_seconds"`
+	// HeartbeatAgeSeconds is local clock minus the newest local heartbeat
+	// (includes clock skew; -1 unknown).
+	HeartbeatAgeSeconds float64 `json:"heartbeat_age_seconds"`
+	MaxLagSeconds       float64 `json:"max_lag_seconds"`
+	MaxLagSeq           int64   `json:"max_lag_seq"`
+	// LagGate is the gate a promotion would use now: "time" or "seq".
+	LagGate      string   `json:"lag_gate"`
+	MasterHost   string   `json:"master_host,omitempty"`
+	MasterPort   int      `json:"master_port,omitempty"`
+	MasterLinkUp bool     `json:"master_link_up"`
+	Replicas     []string `json:"replicas,omitempty"`
+	// LastRenewAgeSeconds is the time since Consul last confirmed our
+	// session (-1 never).
+	LastRenewAgeSeconds float64        `json:"last_renew_age_seconds"`
+	FenceState          string         `json:"fence_state"`
+	FencePending        bool           `json:"fence_pending"`
+	Connections         map[string]int `json:"connections,omitempty"`
+	Events              []Event        `json:"events"`
+	// AdminEnabled tells the page whether POST /handover exists.
+	AdminEnabled bool `json:"admin_enabled"`
+}
+
+// Event is one entry of the recent-events ring buffer.
+type Event struct {
+	Time    string `json:"time"`
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
 }
 
 // Provider supplies the current snapshot + metrics.
@@ -52,5 +90,15 @@ func Handler(p Provider, admin ...Admin) http.Handler {
 		_ = json.NewEncoder(w).Encode(p.Snapshot())
 	})
 	mux.Handle("/metrics", p.Metrics().Handler())
+	ui := uiHandler()
+	mux.Handle("/ui", ui)
+	mux.Handle("/ui/", ui)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		ui.ServeHTTP(w, r)
+	})
 	return mux
 }

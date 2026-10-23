@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +72,20 @@ type Controller struct {
 	peerAt      time.Time // when peerOffset was taken
 	peerSession string
 
+	hb     hbState
+	probed bool // the first tick has probed the local instance
+	lastRI *kvrocks.ReplicationInfo
+
+	evMu          sync.Mutex
+	events        []httpapi.Event
+	lastRefusal   string
+	lastRefusalAt time.Time
+
+	infoMu  sync.RWMutex
+	version string
+	conns   func() map[string]int
+	admin   bool
+
 	rng *rand.Rand
 
 	// cmds runs functions inside the control loop (planned handover).
@@ -86,7 +101,7 @@ type Controller struct {
 
 // New builds a controller.
 func New(cfg *config.Config, deps Deps, log *logx.Logger, reg *metrics.Registry) *Controller {
-	c := &Controller{cfg: cfg, deps: deps, log: log, reg: reg, role: elect.RoleUnknown, lag: -1, peerOffset: -1, rng: rand.New(rand.NewSource(time.Now().UnixNano())), cmds: make(chan func(context.Context))}
+	c := &Controller{cfg: cfg, deps: deps, log: log, reg: reg, role: elect.RoleUnknown, lag: -1, peerOffset: -1, hb: hbState{lag: -1}, rng: rand.New(rand.NewSource(time.Now().UnixNano())), cmds: make(chan func(context.Context))}
 	reg.SetRenewAgeFunc(func() float64 {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
@@ -118,8 +133,79 @@ func (c *Controller) Snapshot() httpapi.Snapshot {
 		s.Leader = c.leader.Node
 		s.LeaderAddr = c.leader.Addr
 		s.Epoch = c.leader.Epoch
+		s.LeaderSince = c.leader.Since
+		if t, err := time.Parse(time.RFC3339Nano, c.leader.Since); err == nil {
+			s.LeaderAgeSeconds = time.Since(t).Seconds()
+		}
 	}
+	s.Cluster = c.cfg.Cluster
+	s.Node = c.cfg.NodeName
+	s.NodeAddr = net.JoinHostPort(c.cfg.AdvertiseAddr, strconv.Itoa(c.cfg.AdvertisePort))
+	s.MaxLagSeconds = c.cfg.MaxLagTime.Seconds()
+	s.MaxLagSeq = c.cfg.MaxLagBytes
+	s.LagSeconds = -1
+	if c.hb.lag >= 0 {
+		s.LagSeconds = c.hb.lag.Seconds()
+	}
+	s.HeartbeatAgeSeconds = -1
+	if c.hb.haveLocal {
+		s.HeartbeatAgeSeconds = time.Since(time.UnixMilli(c.hb.local.UnixMs)).Seconds()
+	}
+	s.LagGate = "seq"
+	if c.role == elect.RoleLeader {
+		s.LagGate = "-"
+	} else if c.hb.havePeer {
+		s.LagGate = "time"
+	}
+	s.LastRenewAgeSeconds = -1
+	if !c.lastRenewOK.IsZero() {
+		s.LastRenewAgeSeconds = time.Since(c.lastRenewOK).Seconds()
+	}
+	s.FencePending = c.fencePending
+	if ri := c.lastRI; ri != nil {
+		s.MasterLinkUp = ri.Role == "slave" && ri.MasterLinkUp
+		if ri.Role == "slave" {
+			s.MasterHost, s.MasterPort = ri.MasterHost, ri.MasterPort
+		}
+		for _, r := range ri.Replicas {
+			s.Replicas = append(s.Replicas, net.JoinHostPort(r.IP, strconv.Itoa(r.Port)))
+		}
+	}
+	s.FenceState = fenceState(c.role, c.backendRole, s.MasterHost, s.MasterPort, c.cfg.FenceHost, c.cfg.FencePort, c.fencePending, c.kvUp)
+	c.infoMu.RLock()
+	s.Version, s.AdminEnabled = c.version, c.admin
+	conns := c.conns
+	c.infoMu.RUnlock()
+	if conns != nil {
+		s.Connections = conns()
+	}
+	s.Events = c.Events()
 	return s
+}
+
+// SetInfo sets what the status page shows besides controller state.
+func (c *Controller) SetInfo(version string, adminEnabled bool, conns func() map[string]int) {
+	c.infoMu.Lock()
+	c.version, c.admin, c.conns = version, adminEnabled, conns
+	c.infoMu.Unlock()
+}
+
+func fenceState(role elect.Role, backendRole, mh string, mp int, fh string, fp int, pending, up bool) string {
+	switch {
+	case !up:
+		return "backend down"
+	case pending:
+		return "fence pending (retrying)"
+	case backendRole == "master" && role == elect.RoleLeader:
+		return "writable master (leader)"
+	case backendRole == "master":
+		return "WRITABLE master without the lock"
+	case backendRole == "slave" && mh == fh && mp == fp:
+		return "fenced (replica of fence target)"
+	case backendRole == "slave":
+		return "replica (read-only)"
+	}
+	return "unknown"
 }
 
 func (c *Controller) Metrics() *metrics.Registry { return c.reg }
@@ -152,7 +238,7 @@ func (c *Controller) serviceID() string { return c.cfg.ServiceName + "-" + c.cfg
 
 // Run blocks until ctx done; performs initial setup then loops.
 func (c *Controller) Run(ctx context.Context) {
-	c.log.Info("starting", map[string]any{"mode": c.cfg.Mode, "key": c.cfg.LeaderKey()})
+	c.log.Info("starting", map[string]any{"mode": c.cfg.Mode, "key": c.cfg.LeaderKey(), "version": c.version})
 	// Best effort: ensure partial-sync friendly config.
 	// kvrocks is often not listening yet when the sidecar starts; then this
 	// is retried when the backend first answers (onBackendBack).
@@ -162,6 +248,9 @@ func (c *Controller) Run(ctx context.Context) {
 	// and testability; watch loop runs separately for followers.
 	go c.watchLoop(ctx)
 	go c.backendReturnWatch(ctx)
+	if c.cfg.Mode != "observe" {
+		go c.heartbeatLoop(ctx)
+	}
 	ticker := time.NewTicker(c.cfg.CheckInterval)
 	defer ticker.Stop()
 	ttlTicker := time.NewTicker(c.cfg.SessionTTL / 3)
@@ -285,16 +374,23 @@ func (c *Controller) tick(ctx context.Context) {
 	c.mu.Lock()
 	if perr != nil {
 		c.kvUp = false
+		c.probed = true
 		c.unhealthy++
 		c.backendRole = ""
 	} else {
 		c.kvUp = true
+		c.probed = true
 		c.unhealthy = 0
 		c.backendRole = ri.Role
+		c.lastRI = ri
 	}
 	unhealthy := c.unhealthy
 	c.mu.Unlock()
 	metrics.SetBool(c.reg.BackendUp, perr == nil)
+	if perr == nil && !c.rsidDone {
+		// The tick may see the instance back before backendReturnWatch.
+		c.ensureRsIDPsync(ctx)
+	}
 
 	if perr != nil {
 		c.log.Warn("kvrocks unhealthy", map[string]any{"streak": unhealthy, "error": perr.Error()})
@@ -336,7 +432,10 @@ func (c *Controller) tick(ctx context.Context) {
 	c.lastConsulOK = time.Now()
 	c.mu.Unlock()
 	c.evaluate(ctx, ri, raw, holder, sid)
-	c.reg.ReplicationLag.Set(float64(c.Snapshot().LagBytes))
+	c.mu.RLock()
+	lagSeq := c.lag
+	c.mu.RUnlock()
+	c.reg.ReplicationLag.Set(float64(lagSeq))
 }
 
 // sampleLeader records the leader's replication offset so the lag gate has
@@ -462,6 +561,9 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 		c.mu.Unlock()
 		c.sampleLeader(ctx, holder, c.followTarget(lv))
 		c.updateLag(ri)
+		if c.cfg.Mode == "observe" && c.cfg.HeartbeatInterval > 0 {
+			c.readHeartbeats(ctx, nil) // GETs only, at the check interval
+		}
 		c.onFollow(ctx, ri, lv)
 	}
 }
@@ -604,10 +706,25 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		// the unknown-lag path requires the full hold-down — safe default.)
 		lastSeen = time.Now()
 	}
-	dec := elect.LagGate(elect.LagGateInput{Lag: lag, MaxLag: c.cfg.MaxLagBytes, SampleAge: sampleAge, MaxSampleAge: c.cfg.LagSampleMaxAge,
-		LastSeen: lastSeen, HaveOld: haveOld, HoldDown: c.cfg.HoldDown, MaxWait: c.cfg.LagGateMaxWait, Now: time.Now()})
+	in := elect.LagGateInput{Lag: lag, MaxLag: c.cfg.MaxLagBytes, SampleAge: sampleAge, MaxSampleAge: c.cfg.LagSampleMaxAge,
+		LastSeen: lastSeen, HaveOld: haveOld, HoldDown: c.cfg.HoldDown, MaxWait: c.cfg.LagGateMaxWait, Now: time.Now()}
+	gate := "seq"
+	if haveOld && c.cfg.HeartbeatInterval > 0 {
+		// Fresh reads: the departed leader's heartbeat if its kvrocks still
+		// answers, and our own copy.
+		if t := c.followTarget(oldMaster); t != nil {
+			c.readHeartbeats(ctx, &electTarget{addr: t.Addr, port: t.Port, session: oldMaster.Session})
+		}
+		if ms, age, ok := c.timeGateInput(oldSeen); ok {
+			gate, in.Lag, in.MaxLag, in.SampleAge = "time", ms, c.cfg.MaxLagTime.Milliseconds(), age
+		}
+	}
+	dec := elect.LagGate(in)
+	lag = in.Lag
 	if !dec.Allow {
-		c.log.Warn("promotion refused by lag gate", map[string]any{"lag": lag, "sample_age": sampleAge.String(), "reason": dec.Reason})
+		c.reg.LagRefusals.Inc()
+		c.event("lag_gate", fmt.Sprintf("promotion refused (%s gate, lag %s): %s", gate, fmtLag(gate, lag), dec.Reason))
+		c.log.Warn("promotion refused by lag gate", map[string]any{"gate": gate, "lag": lag, "sample_age": sampleAge.String(), "reason": dec.Reason})
 		// Stay follower; keep replica registration, and make sure we are
 		// not a writable master while nobody holds the lock.
 		c.setRole(elect.RoleFollower)
@@ -617,10 +734,10 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		}
 		return
 	}
-	if lag > c.cfg.MaxLagBytes && dec.Allow {
-		c.log.Warn("promoting despite lag", map[string]any{"lag": lag, "reason": dec.Reason})
+	if lag > in.MaxLag {
+		c.log.Warn("promoting despite lag", map[string]any{"gate": gate, "lag": lag, "reason": dec.Reason})
 	} else if dec.Reason != "lag within bound" {
-		c.log.Warn("promoting with unknown lag", map[string]any{"reason": dec.Reason})
+		c.log.Warn("promoting with unknown lag", map[string]any{"gate": gate, "reason": dec.Reason})
 	}
 	if ec, ok := c.deps.Lock.(consulstore.EpochCounter); ok && c.cfg.Mode != "observe" {
 		// The counter key is never released or rewritten by anyone else,
@@ -665,7 +782,8 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	c.mu.Unlock()
 	c.setRole(elect.RoleLeader)
 	c.reg.LeaderAcquired.Inc()
-	c.log.Info("became leader", map[string]any{"epoch": epoch})
+	c.event("election", fmt.Sprintf("became leader, epoch %d (%s gate, lag %s: %s)", epoch, gate, fmtLag(gate, lag), dec.Reason))
+	c.log.Info("became leader", map[string]any{"epoch": epoch, "gate": gate, "lag": lag})
 }
 
 func (c *Controller) sessionIDValue() string {
@@ -709,6 +827,7 @@ func (c *Controller) followLeader(ctx context.Context, lv *consulstore.LeaderVal
 		return
 	}
 	_ = c.deps.KV.SetReadOnly(fctx, true)
+	c.event("follow", "following leader "+lv.Node)
 	c.log.Info("following leader", map[string]any{"leader": lv.Node})
 }
 
@@ -724,6 +843,7 @@ func (c *Controller) followLeader(ctx context.Context, lv *consulstore.LeaderVal
 // sync from a real leader.
 func (c *Controller) demote(ctx context.Context, label, reason string, target *consulstore.LeaderValue) {
 	c.reg.StepDowns.WithLabelValues(label).Inc()
+	c.event("step_down", label+": "+reason)
 	c.log.Warn("demoting", map[string]any{"reason": reason})
 	if c.cfg.Mode == "observe" {
 		c.observeLog("observe: would demote (remove master registration, REPLICAOF leader or fence target)", nil)
@@ -760,6 +880,7 @@ func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue)
 	if err := c.deps.KV.ReplicaOf(kctx, host, port); err != nil {
 		c.reg.Fencing.WithLabelValues(kind, "error").Inc()
 		c.setFencePending()
+		c.event("fence", fmt.Sprintf("fence REPLICAOF %s:%d failed: %v", host, port, err))
 		c.log.Error("fence REPLICAOF failed; instance may still accept writes", map[string]any{"error": err.Error(), "host": host, "port": port})
 		return false
 	}
@@ -775,6 +896,7 @@ func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue)
 		}
 		c.reg.Fencing.WithLabelValues(kind, "error").Inc()
 		c.setFencePending()
+		c.event("fence", "fence not confirmed; role "+role)
 		c.log.Error("fence not confirmed; instance may still accept writes", map[string]any{"error": msg, "role": role, "host": host, "port": port})
 		return false
 	}
@@ -785,6 +907,7 @@ func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue)
 	c.fenceGen.Add(1)
 	c.notify()
 	_ = c.deps.KV.SetReadOnly(kctx, true)
+	c.event("fence", fmt.Sprintf("fenced: replica of %s:%d", host, port))
 	c.log.Info("fenced: now a read-only replica", map[string]any{"host": host, "port": port, "leader_known": target != nil})
 	return true
 }
@@ -990,7 +1113,9 @@ func (c *Controller) backendReturnWatch(ctx context.Context) {
 		case <-t.C:
 		}
 		c.mu.RLock()
-		watch := !c.kvUp || c.fencePending
+		// Before the first probe kvUp is false only because nothing has
+		// been checked yet; startup is handled by the first tick.
+		watch := (c.probed && !c.kvUp) || c.fencePending
 		c.mu.RUnlock()
 		if !watch {
 			continue
@@ -1101,3 +1226,13 @@ func (c *Controller) observeLog(msg string, fields map[string]any) {
 }
 
 const observeRepeat = 5 * time.Minute
+
+func fmtLag(gate string, lag int64) string {
+	if lag < 0 {
+		return "unknown"
+	}
+	if gate == "time" {
+		return (time.Duration(lag) * time.Millisecond).String()
+	}
+	return strconv.FormatInt(lag, 10) + " seq"
+}

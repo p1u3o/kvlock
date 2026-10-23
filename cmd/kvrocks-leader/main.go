@@ -20,6 +20,9 @@ import (
 	"github.com/p1u3o/kvlock/internal/sentinel"
 )
 
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "handover" {
 		os.Exit(runHandover(os.Args[2:], os.Stdout, os.Stderr))
@@ -114,5 +117,12 @@ func main() {
 		cancel()
 	}()
 
+	c.SetInfo(version, true, func() map[string]int {
+		m := reg.ProxyActiveCounts()
+		if sent != nil {
+			m["sentinel"] = sent.NumConns()
+		}
+		return m
+	})
 	c.Run(ctx)
 }

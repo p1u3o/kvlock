@@ -47,7 +47,7 @@ func startProxy(name, addr string, route proxy.Route, v proxyViewer, reg *metric
 		return nil, err
 	}
 	p := &proxy.Proxy{Name: name, Route: route, Notify: v.Subscribe(), Logf: log.Info, Counters: proxy.Counters{
-		Active:  func(d float64) { reg.ProxyActive.WithLabelValues(name).Add(d) },
+		Active:  func(d float64) { reg.AddProxyActive(name, d) },
 		Dropped: func(n int) { reg.ProxyDropped.WithLabelValues(name).Add(float64(n)) },
 		Refused: func() { reg.ProxyRefused.WithLabelValues(name).Inc() },
 	}}

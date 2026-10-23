@@ -45,6 +45,13 @@ type Config struct {
 	// LagGateMaxWait: promote a lagging replica anyway once the old leader
 	// has been gone this long. 0 = refuse until it returns.
 	LagGateMaxWait time.Duration
+	// MaxLagTime is the heartbeat lag (time) a replica may be behind and
+	// still promote. The time gate is used whenever the departed leader's
+	// heartbeat was sampled; otherwise the offset gate (MaxLagBytes) applies.
+	MaxLagTime time.Duration
+	// HeartbeatInterval is how often the leader writes its heartbeat key
+	// and replicas read it. 0 disables heartbeats (offset gate only).
+	HeartbeatInterval time.Duration
 
 	ServiceName string
 	MasterTag   string
@@ -177,6 +184,8 @@ func Parse(args []string) (*Config, error) {
 	fs.Int64Var(&c.MaxLagBytes, "max-lag-bytes", c.MaxLagBytes, "Old name for --max-lag ($MAX_LAG_BYTES)")
 	fs.DurationVar(&c.LagSampleMaxAge, "lag-sample-max-age", getenvDur("LAG_SAMPLE_MAX_AGE", 0), "Treat the leader offset sample as unknown lag if it was older than this when the leader disappeared; 0 = 3x --check-interval ($LAG_SAMPLE_MAX_AGE)")
 	fs.DurationVar(&c.LagGateMaxWait, "lag-gate-max-wait", getenvDur("LAG_GATE_MAX_WAIT", 5*time.Minute), "Promote a replica that is over --max-lag anyway once the old leader has been gone this long, accepting the loss of its unreplicated writes; 0 = wait forever ($LAG_GATE_MAX_WAIT)")
+	fs.DurationVar(&c.MaxLagTime, "max-lag-time", getenvDur("MAX_LAG_TIME", 2*time.Second), "Max heartbeat lag (time behind the leader) tolerated before refusing promotion ($MAX_LAG_TIME)")
+	fs.DurationVar(&c.HeartbeatInterval, "heartbeat-interval", getenvDur("HEARTBEAT_INTERVAL", 250*time.Millisecond), "Leader writes the heartbeat key kvlock:hb:<cluster> this often; replicas read it at the same rate; 0 disables ($HEARTBEAT_INTERVAL)")
 	fs.DurationVar(&c.HoldDown, "hold-down", getenvDur("HOLD_DOWN", 30*time.Second), "Promote with unknown lag only if old master unreachable this long ($HOLD_DOWN)")
 
 	fs.StringVar(&c.ProxyAddr, "proxy-addr", getenv("PROXY_ADDR", ""), "Listen address for the TCP leader proxy, e.g. :6380 ($PROXY_ADDR, default: disabled)")
@@ -274,6 +283,15 @@ func Parse(args []string) (*Config, error) {
 	if c.LagGateMaxWait < 0 {
 		return nil, fmt.Errorf("--lag-gate-max-wait must be >= 0")
 	}
+	if c.MaxLagTime <= 0 {
+		return nil, fmt.Errorf("--max-lag-time must be > 0")
+	}
+	if c.HeartbeatInterval < 0 {
+		return nil, fmt.Errorf("--heartbeat-interval must be >= 0")
+	}
+	if c.HeartbeatInterval > 0 && c.HeartbeatInterval < 50*time.Millisecond {
+		return nil, fmt.Errorf("--heartbeat-interval %v too short: minimum 50ms", c.HeartbeatInterval)
+	}
 	if c.HandoverMaxLag < 0 {
 		c.HandoverMaxLag = c.MaxLagBytes
 	}
@@ -304,6 +322,10 @@ func (c *Config) EpochKey() string {
 	k := c.LeaderKey() // always ends in "leader"
 	return k[:len(k)-len("leader")] + "epoch"
 }
+
+// HeartbeatKey is the key the leader writes into its kvrocks so replicas
+// can measure lag in time. It replicates like any other write.
+func (c *Config) HeartbeatKey() string { return "kvlock:hb:" + c.Cluster }
 
 func bytesTrim(b []byte) []byte {
 	// Trim trailing newline/CR/spaces without importing bytes for one call.

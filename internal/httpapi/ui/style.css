@@ -1,0 +1,12 @@
+body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#f4f5f7;color:#1d2330}
+header{display:flex;gap:1rem;align-items:center;padding:.8rem 1.2rem;background:#1d2330;color:#fff}
+h1{font-size:1.2rem;margin:0}h2{font-size:.95rem;margin:0 0 .6rem;color:#4a5468;text-transform:uppercase;letter-spacing:.04em}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem;padding:1rem}
+.card{background:#fff;border-radius:8px;padding:1rem;box-shadow:0 1px 2px rgba(0,0,0,.08)}.wide{grid-column:1/-1}
+dl{display:grid;grid-template-columns:9rem 1fr;gap:.35rem .8rem;margin:0}dt{color:#6b7385}dd{margin:0;font-family:ui-monospace,monospace;word-break:break-all}
+.badge{padding:.15rem .6rem;border-radius:99px;background:#6b7385;font-size:.85rem}
+.leader{background:#1f8a4c}.follower{background:#2f6fd0}.bad{background:#c0392b}.muted{color:#8a93a6;font-size:.85rem}
+.ok{color:#1f8a4c}.warn{color:#c27c0e}.err{color:#c0392b}
+table{width:100%;border-collapse:collapse;font-size:.9rem}td,th{text-align:left;padding:.3rem .5rem;border-bottom:1px solid #eceef2}
+td:first-child{white-space:nowrap;font-family:ui-monospace,monospace}
+input{padding:.4rem;width:18rem}button{padding:.4rem .8rem;margin-left:.5rem}pre{white-space:pre-wrap}

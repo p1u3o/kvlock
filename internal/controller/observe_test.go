@@ -20,6 +20,9 @@ func assertNoSideEffects(t *testing.T, kv *fakeKV, reg *fakeRegistrar) {
 	if kv.promotions != 0 || kv.follows != 0 {
 		t.Errorf("observe sent REPLICAOF: promotions=%d follows=%d", kv.promotions, kv.follows)
 	}
+	if kv.hbSets != 0 {
+		t.Errorf("observe wrote the heartbeat key %d times", kv.hbSets)
+	}
 	if kv.kills != 0 {
 		t.Errorf("observe killed clients: %d", kv.kills)
 	}

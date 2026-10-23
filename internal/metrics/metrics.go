@@ -1,12 +1,14 @@
 // Package metrics holds the sidecar's Prometheus metrics.
 //
-// Metric names are kept unprefixed (is_leader, elections_total, ...) so
-// existing scrapes and dashboards keep working.
+// Since v0.2.0 every sidecar metric carries the kvlock_ prefix
+// (kvlock_is_leader, kvlock_elections_total, ...). The Go and process
+// collectors keep their standard go_/process_ names.
 package metrics
 
 import (
 	"math"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,6 +27,9 @@ const (
 	ReasonShutdown           = "shutdown"
 )
 
+// Namespace prefixes every sidecar metric name.
+const Namespace = "kvlock"
+
 // Registry owns a private Prometheus registry and the sidecar's metrics.
 type Registry struct {
 	prom *prometheus.Registry
@@ -32,6 +37,12 @@ type Registry struct {
 	IsLeader       prometheus.Gauge
 	BackendUp      prometheus.Gauge
 	ReplicationLag prometheus.Gauge
+	// LagSeconds is the heartbeat-based lag behind the leader.
+	LagSeconds prometheus.Gauge
+	// HeartbeatAge is now minus the newest heartbeat in the local instance.
+	HeartbeatAge prometheus.Gauge
+	Heartbeats   *prometheus.CounterVec // result=ok|error
+	LagRefusals  prometheus.Counter
 
 	Elections      prometheus.Counter
 	LeaderAcquired prometheus.Counter
@@ -46,6 +57,9 @@ type Registry struct {
 	ProxyDropped   *prometheus.CounterVec // listener
 	ProxyRefused   *prometheus.CounterVec // listener
 
+	connMu sync.Mutex
+	conns  map[string]float64
+
 	renewAge atomic.Pointer[func() float64]
 	lockHeld atomic.Pointer[func() float64]
 }
@@ -53,32 +67,41 @@ type Registry struct {
 // New builds a Registry with every metric registered and zero-initialised.
 func New() *Registry {
 	r := &Registry{prom: prometheus.NewRegistry()}
-	r.IsLeader = prometheus.NewGauge(prometheus.GaugeOpts{Name: "is_leader", Help: "1 while this sidecar holds the leader lock."})
-	r.BackendUp = prometheus.NewGauge(prometheus.GaugeOpts{Name: "kvrocks_up", Help: "1 while the local backend answers PING and INFO."})
-	r.ReplicationLag = prometheus.NewGauge(prometheus.GaugeOpts{Name: "replication_lag_bytes", Help: "Lag behind the leader (kvrocks: sequence numbers, Redis: bytes); -1 unknown, 0 on the leader."})
-	r.Elections = prometheus.NewCounter(prometheus.CounterOpts{Name: "elections_total", Help: "Lock acquisition attempts."})
-	r.LeaderAcquired = prometheus.NewCounter(prometheus.CounterOpts{Name: "leader_acquired_total", Help: "Times this node won the lock (failovers/handovers onto this node)."})
-	r.LeaderChanges = prometheus.NewCounter(prometheus.CounterOpts{Name: "leader_changes_total", Help: "Local role transitions."})
-	r.StepDowns = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "step_downs_total", Help: "Times this node stopped being leader, by reason."}, []string{"reason"})
-	r.Fencing = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "fencing_events_total", Help: "REPLICAOF fencing attempts, by target kind and result."}, []string{"target", "result"})
-	r.ConsulErrors = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "consul_errors_total", Help: "Failed Consul calls, by operation."}, []string{"op"})
-	r.ClientKills = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "client_kill_runs_total", Help: "Client-kill runs after demotion, by result."}, []string{"result"})
-	r.ClientsKilled = prometheus.NewCounter(prometheus.CounterOpts{Name: "clients_killed_total", Help: "Client connections closed after demotion."})
-	r.Handovers = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "handovers_total", Help: "Planned handover requests, by result."}, []string{"result"})
-	r.ProxyActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "proxy_active_connections", Help: "Currently proxied client connections, by listener (write|read)."}, []string{"listener"})
-	r.ProxyDropped = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "proxy_dropped_connections_total", Help: "Proxied connections closed because the routing target changed (failover, fencing, lost Consul confirmation)."}, []string{"listener"})
-	r.ProxyRefused = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "proxy_refused_connections_total", Help: "Connections refused because no safe target was known or the dial failed."}, []string{"listener"})
+	r.IsLeader = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "is_leader", Help: "1 while this sidecar holds the leader lock."})
+	r.BackendUp = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "kvrocks_up", Help: "1 while the local backend answers PING and INFO."})
+	r.ReplicationLag = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "replication_lag_bytes", Help: "Lag behind the leader (kvrocks: sequence numbers, Redis: bytes); -1 unknown, 0 on the leader."})
+	r.LagSeconds = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "replication_lag_seconds", Help: "Heartbeat lag behind the leader in seconds (leader heartbeat minus the heartbeat replicated locally); -1 unknown, 0 on the leader."})
+	r.HeartbeatAge = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "heartbeat_age_seconds", Help: "Local clock minus the newest heartbeat in the local instance (includes clock skew); -1 unknown."})
+	r.Heartbeats = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "heartbeat_writes_total", Help: "Heartbeat writes by the leader, by result."}, []string{"result"})
+	r.LagRefusals = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "lag_gate_refusals_total", Help: "Promotions refused by the lag gate."})
+	r.Elections = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "elections_total", Help: "Lock acquisition attempts."})
+	r.LeaderAcquired = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "leader_acquired_total", Help: "Times this node won the lock (failovers/handovers onto this node)."})
+	r.LeaderChanges = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "leader_changes_total", Help: "Local role transitions."})
+	r.StepDowns = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "step_downs_total", Help: "Times this node stopped being leader, by reason."}, []string{"reason"})
+	r.Fencing = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "fencing_events_total", Help: "REPLICAOF fencing attempts, by target kind and result."}, []string{"target", "result"})
+	r.ConsulErrors = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "consul_errors_total", Help: "Failed Consul calls, by operation."}, []string{"op"})
+	r.ClientKills = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "client_kill_runs_total", Help: "Client-kill runs after demotion, by result."}, []string{"result"})
+	r.ClientsKilled = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "clients_killed_total", Help: "Client connections closed after demotion."})
+	r.Handovers = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "handovers_total", Help: "Planned handover requests, by result."}, []string{"result"})
+	r.ProxyActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: Namespace, Name: "proxy_active_connections", Help: "Currently proxied client connections, by listener (write|read)."}, []string{"listener"})
+	r.ProxyDropped = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "proxy_dropped_connections_total", Help: "Proxied connections closed because the routing target changed (failover, fencing, lost Consul confirmation)."}, []string{"listener"})
+	r.ProxyRefused = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "proxy_refused_connections_total", Help: "Connections refused because no safe target was known or the dial failed."}, []string{"listener"})
 
-	renew := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "consul_last_renew_age_seconds", Help: "Seconds since Consul last confirmed our session; +Inf before the first success."},
+	renew := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: Namespace, Name: "consul_last_renew_age_seconds", Help: "Seconds since Consul last confirmed our session; +Inf before the first success."},
 		func() float64 { return call(&r.renewAge, math.Inf(1)) })
-	held := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "lock_held_seconds", Help: "Seconds this node has held the leader lock; 0 when not leader."},
+	held := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: Namespace, Name: "lock_held_seconds", Help: "Seconds this node has held the leader lock; 0 when not leader."},
 		func() float64 { return call(&r.lockHeld, 0) })
 
 	r.prom.MustRegister(r.IsLeader, r.BackendUp, r.ReplicationLag, r.Elections, r.LeaderAcquired, r.LeaderChanges,
 		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, r.ProxyActive, r.ProxyDropped, r.ProxyRefused, renew, held,
+		r.LagSeconds, r.HeartbeatAge, r.Heartbeats, r.LagRefusals,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	r.ReplicationLag.Set(-1)
+	r.LagSeconds.Set(-1)
+	r.HeartbeatAge.Set(-1)
+	r.Heartbeats.WithLabelValues("ok")
+	r.Heartbeats.WithLabelValues("error")
 	for _, reason := range []string{ReasonBackendUnhealthy, ReasonSessionInvalidated, ReasonConsulUnreachable, ReasonLockLost, ReasonLockTaken, ReasonHandover, ReasonShutdown} {
 		r.StepDowns.WithLabelValues(reason)
 	}
@@ -121,3 +144,26 @@ func (r *Registry) Handler() http.Handler {
 
 // Gatherer exposes the underlying registry (tests).
 func (r *Registry) Gatherer() prometheus.Gatherer { return r.prom }
+
+// AddProxyActive adjusts kvlock_proxy_active_connections for a listener
+// and the copy shown on the status page.
+func (r *Registry) AddProxyActive(listener string, d float64) {
+	r.ProxyActive.WithLabelValues(listener).Add(d)
+	r.connMu.Lock()
+	if r.conns == nil {
+		r.conns = map[string]float64{}
+	}
+	r.conns[listener] += d
+	r.connMu.Unlock()
+}
+
+// ProxyActiveCounts returns the active proxied connections per listener.
+func (r *Registry) ProxyActiveCounts() map[string]int {
+	r.connMu.Lock()
+	defer r.connMu.Unlock()
+	out := make(map[string]int, len(r.conns))
+	for k, v := range r.conns {
+		out[k] = int(v)
+	}
+	return out
+}

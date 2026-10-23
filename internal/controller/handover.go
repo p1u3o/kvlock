@@ -58,9 +58,11 @@ func (c *Controller) Handover(ctx context.Context, req httpapi.HandoverRequest) 
 	}
 	abort := func(r httpapi.HandoverResult, err error) (httpapi.HandoverResult, error) {
 		c.reg.Handovers.WithLabelValues("aborted").Inc()
+		c.event("handover", "handover aborted at "+r.Stage+": "+err.Error())
 		c.log.Warn("handover aborted", map[string]any{"stage": r.Stage, "error": err.Error(), "still_leader": r.StillLeader})
 		return r, err
 	}
+	c.event("handover", "handover requested to "+nonEmptyStr(req.To, "best replica"))
 	c.log.Info("handover requested", map[string]any{"to": req.To, "max_lag": maxLag, "timeout": timeout.String()})
 
 	res.Stage = "waiting"
@@ -109,6 +111,7 @@ func (c *Controller) Handover(ctx context.Context, req httpapi.HandoverRequest) 
 			}
 			res.Stage = "done"
 			c.reg.Handovers.WithLabelValues("ok").Inc()
+			c.event("handover", "handover complete; new leader "+res.NewLeader)
 			c.log.Info("handover complete", map[string]any{"new_leader": res.NewLeader})
 			return res, nil
 		}
@@ -227,6 +230,7 @@ func (c *Controller) commitHandover(ctx context.Context, to string, maxLag int64
 	c.leaderSince = time.Time{}
 	c.mu.Unlock()
 	c.registerReplica(ctx)
+	c.event("handover", "handover committed to "+cand.Addr+": lock released")
 	c.log.Info("handover committed: lock released", map[string]any{"target": cand.Addr, "final_offset": final})
 	return commitResult{target: cand.Addr, lag: cand.Lag}
 }
@@ -317,6 +321,14 @@ func (c *Controller) shutdownHandover(ctx context.Context) bool {
 		return false
 	}
 	c.reg.Handovers.WithLabelValues("ok").Inc()
+	c.event("handover", "handed over on shutdown to "+cr.target)
 	c.log.Info("handed over on shutdown", map[string]any{"target": cr.target, "lag": cr.lag})
 	return true
+}
+
+func nonEmptyStr(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }

@@ -120,6 +120,13 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
+// NumConns returns the number of open client connections.
+func (s *Server) NumConns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.conns)
+}
+
 // Close stops the listener and drops all connections.
 func (s *Server) Close() error {
 	s.mu.Lock()

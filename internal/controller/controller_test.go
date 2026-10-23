@@ -186,6 +186,41 @@ type fakeKV struct {
 	rsidCalls int
 	rsidOK    int
 	setRO     int
+
+	hbLocal   string // heartbeat value in the local instance
+	hbPeer    string // heartbeat value in the leader's instance
+	hbSets    int
+	hbPeerErr error
+}
+
+func (f *fakeKV) SetHeartbeat(ctx context.Context, key, v string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.up {
+		return f.downError()
+	}
+	f.hbSets++
+	f.hbLocal = v
+	return nil
+}
+func (f *fakeKV) GetHeartbeat(ctx context.Context, key string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.up {
+		return "", f.downError()
+	}
+	return f.hbLocal, nil
+}
+func (f *fakeKV) PeerGetHeartbeat(ctx context.Context, h string, p int, key string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.hbPeerErr != nil {
+		return "", f.hbPeerErr
+	}
+	if f.peerErr != nil {
+		return "", f.peerErr
+	}
+	return f.hbPeer, nil
 }
 
 func (f *fakeKV) downError() error {
@@ -294,6 +329,7 @@ func testConfig(node string) *config.Config {
 		HTTPAddr: ":0", CheckInterval: 20 * time.Millisecond,
 		KillClientsOnDemote: true,
 		HandoverTimeout:     2 * time.Second, HandoverMaxLag: 1000,
+		MaxLagTime: 2 * time.Second, HeartbeatInterval: 10 * time.Millisecond,
 	}
 }
 

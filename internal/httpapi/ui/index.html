@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kvlock</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<header>
+  <h1>kvlock <span id="cluster"></span></h1>
+  <span id="badge" class="badge">loading</span>
+  <span id="updated" class="muted"></span>
+</header>
+<main>
+  <section class="card">
+    <h2>This node</h2>
+    <dl>
+      <dt>Node</dt><dd id="node"></dd>
+      <dt>Address</dt><dd id="node_addr"></dd>
+      <dt>Mode</dt><dd id="mode"></dd>
+      <dt>Role</dt><dd id="role"></dd>
+      <dt>Instance role</dt><dd id="backend_role"></dd>
+      <dt>Version</dt><dd id="version"></dd>
+    </dl>
+  </section>
+  <section class="card">
+    <h2>Leader</h2>
+    <dl>
+      <dt>Node</dt><dd id="leader"></dd>
+      <dt>Address</dt><dd id="leader_addr"></dd>
+      <dt>Epoch</dt><dd id="epoch"></dd>
+      <dt>Held for</dt><dd id="leader_age"></dd>
+      <dt>Consul renew</dt><dd id="renew_age"></dd>
+    </dl>
+  </section>
+  <section class="card">
+    <h2>Replication</h2>
+    <dl>
+      <dt>Master</dt><dd id="master"></dd>
+      <dt>Link</dt><dd id="link"></dd>
+      <dt>Replicas</dt><dd id="replicas"></dd>
+      <dt>Lag (time)</dt><dd id="lag_time"></dd>
+      <dt>Lag (seq)</dt><dd id="lag_seq"></dd>
+      <dt>Promotion gate</dt><dd id="gate"></dd>
+    </dl>
+  </section>
+  <section class="card">
+    <h2>Health</h2>
+    <dl>
+      <dt>Healthy</dt><dd id="healthy"></dd>
+      <dt>Instance up</dt><dd id="kv_up"></dd>
+      <dt>Consul</dt><dd id="consul"></dd>
+      <dt>Fencing</dt><dd id="fence"></dd>
+      <dt>Problems</dt><dd id="problems"></dd>
+      <dt>Connections</dt><dd id="conns"></dd>
+    </dl>
+  </section>
+  <section class="card wide">
+    <h2>Recent events</h2>
+    <table><thead><tr><th>Time</th><th>Kind</th><th>Event</th></tr></thead><tbody id="events"></tbody></table>
+  </section>
+  <section class="card wide" id="admin">
+    <h2>Admin</h2>
+    <p class="muted">The page is read-only. Enter the admin token to enable a planned handover (POST /handover). The token stays in this tab only.</p>
+    <input id="token" type="password" autocomplete="off" placeholder="admin token">
+    <button id="handover" hidden>Hand over leadership</button>
+    <pre id="admin_out"></pre>
+  </section>
+</main>
+<script src="/ui/app.js"></script>
+</body>
+</html>

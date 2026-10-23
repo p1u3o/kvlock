@@ -37,6 +37,7 @@ package kvrocks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -92,6 +93,14 @@ type Client interface {
 	// (never replication links or the sidecar's own connection) and
 	// returns how many were closed.
 	KillClients(ctx context.Context) (int64, error)
+	// SetHeartbeat writes the leader heartbeat value to the local instance.
+	SetHeartbeat(ctx context.Context, key, value string) error
+	// GetHeartbeat reads the heartbeat from the local instance; "" when the
+	// key does not exist.
+	GetHeartbeat(ctx context.Context, key string) (string, error)
+	// PeerGetHeartbeat reads the heartbeat from another instance (the
+	// leader) using the same credentials; "" when the key does not exist.
+	PeerGetHeartbeat(ctx context.Context, host string, port int, key string) (string, error)
 	// Close releases resources.
 	Close() error
 }
@@ -154,7 +163,7 @@ func (c *RedisClient) InfoReplication(ctx context.Context) (*ReplicationInfo, er
 	return ParseInfoReplication(s), nil
 }
 
-func (c *RedisClient) PeerInfoReplication(ctx context.Context, host string, port int) (*ReplicationInfo, error) {
+func (c *RedisClient) peerClient(host string, port int) *redis.Client {
 	addr := fmt.Sprintf("%s:%d", host, port)
 	c.peerMu.Lock()
 	if c.peer == nil || c.peerAddr != addr {
@@ -170,6 +179,11 @@ func (c *RedisClient) PeerInfoReplication(ctx context.Context, host string, port
 	}
 	peer := c.peer
 	c.peerMu.Unlock()
+	return peer
+}
+
+func (c *RedisClient) PeerInfoReplication(ctx context.Context, host string, port int) (*ReplicationInfo, error) {
+	peer := c.peerClient(host, port)
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
 	s, err := peer.Info(ctx, "replication").Result()
@@ -177,6 +191,33 @@ func (c *RedisClient) PeerInfoReplication(ctx context.Context, host string, port
 		return nil, err
 	}
 	return ParseInfoReplication(s), nil
+}
+
+func (c *RedisClient) SetHeartbeat(ctx context.Context, key, value string) error {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	return c.rdb.Set(ctx, key, value, 0).Err()
+}
+
+func (c *RedisClient) GetHeartbeat(ctx context.Context, key string) (string, error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	return getOrEmpty(c.rdb.Get(ctx, key))
+}
+
+func (c *RedisClient) PeerGetHeartbeat(ctx context.Context, host string, port int, key string) (string, error) {
+	peer := c.peerClient(host, port)
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	return getOrEmpty(peer.Get(ctx, key))
+}
+
+func getOrEmpty(cmd *redis.StringCmd) (string, error) {
+	v, err := cmd.Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	return v, err
 }
 
 func (c *RedisClient) ReplicaOf(ctx context.Context, host string, port int) error {
