@@ -11,13 +11,28 @@
 //     kvrocks.conf (default "no"). We set "yes" so a failover can PSYNC.
 //   - PING, INFO supported since v1.0.0.
 //
-// UNVERIFIED (see README): the exact field names kvrocks reports for a
-// replica's lag (Redis uses master_repl_offset vs slave_repl_offset and
-// slave0:ip,port,offset). Kvrocks INFO replication documents role and
-// master_repl_offset only; replica-side field names are parsed
-// defensively and lag may be reported unknown. Likewise the read-only
-// flag name (Redis replica-read-only vs slave-read-only) is applied
-// best-effort and failures are logged, not fatal.
+// INFO replication (verified against kvrocks v2.11.0 src/server/server.cc,
+// Server::GetReplicationInfo):
+//
+//	role:slave                      (replica only:)
+//	master_host / master_port / master_link_status:up|down
+//	master_sync_in_progress / master_last_io_seconds_ago
+//	slave_repl_offset:<local rocksdb latest sequence number>
+//	connected_slaves:N
+//	slaveK:ip=..,port=..,offset=<replica seq>,lag=<master seq - replica seq>
+//	master_repl_offset:<local rocksdb latest sequence number>
+//
+// On a kvrocks replica master_repl_offset is the replica's OWN sequence
+// number (identical to slave_repl_offset), not the master's, so a replica
+// cannot compute its lag from its own INFO. Redis behaves the same way in
+// practice (both fields track the replica's position). Lag is therefore
+// computed by the controller from the leader's master_repl_offset, sampled
+// while the leader is reachable, minus our local offset. kvrocks offsets
+// are sequence numbers (write batches), not bytes.
+//
+// Read-only flag: kvrocks only knows slave-read-only (default yes); Redis
+// accepts both replica-read-only and slave-read-only. It only has an effect
+// on replicas, which is why fencing uses REPLICAOF.
 package kvrocks
 
 import (
@@ -25,6 +40,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -36,11 +52,19 @@ type ReplicationInfo struct {
 	MasterHost      string
 	MasterPort      int
 	MasterLinkUp    bool
-	LocalOffset     int64
-	MasterOffset    int64 // our copy of master's offset, -1 if unknown
-	LagBytes        int64 // MasterOffset-LocalOffset, -1 if unknown
+	LocalOffset     int64 // this instance's replication offset / sequence
+	MasterOffset    int64 // master_repl_offset when role=master, else -1
+	LagBytes        int64 // 0 on a master; -1 (unknown) on a replica
 	ConnectedSlaves int
+	Replicas        []ReplicaState // slaveN lines (master only)
 	Raw             string
+}
+
+// ReplicaState is one slaveN line as seen by a master.
+type ReplicaState struct {
+	IP     string
+	Port   int
+	Offset int64
 }
 
 // Client is the sidecar's view of the local kvrocks.
@@ -49,6 +73,9 @@ type Client interface {
 	Ping(ctx context.Context) error
 	// InfoReplication returns parsed replication state.
 	InfoReplication(ctx context.Context) (*ReplicationInfo, error)
+	// PeerInfoReplication reads INFO replication from another instance
+	// (the current leader) using the same credentials.
+	PeerInfoReplication(ctx context.Context, host string, port int) (*ReplicationInfo, error)
 	// ReplicaOf points local at a master; pass ("NO","ONE") to promote.
 	// Implementations must try REPLICAOF first, SLAVEOF as fallback.
 	ReplicaOf(ctx context.Context, host string, port int) error
@@ -66,9 +93,14 @@ type Client interface {
 
 // RedisClient is the production Client.
 type RedisClient struct {
-	rdb     *redis.Client
-	timeout time.Duration
-	kind    string // "kvrocks" or "redis"
+	rdb      *redis.Client
+	timeout  time.Duration
+	kind     string // "kvrocks" or "redis"
+	password string
+
+	peerMu   sync.Mutex
+	peerAddr string
+	peer     *redis.Client
 }
 
 // New creates a client for addr:port with optional password.
@@ -84,7 +116,7 @@ func New(addr string, port int, password string, timeout time.Duration, kind ...
 	if len(kind) > 0 && kind[0] != "" {
 		k = kind[0]
 	}
-	return &RedisClient{rdb: rdb, timeout: timeout, kind: k}
+	return &RedisClient{rdb: rdb, timeout: timeout, kind: k, password: password}
 }
 
 func (c *RedisClient) ctx(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -101,6 +133,31 @@ func (c *RedisClient) InfoReplication(ctx context.Context) (*ReplicationInfo, er
 	ctx, cancel := c.ctx(ctx)
 	defer cancel()
 	s, err := c.rdb.Info(ctx, "replication").Result()
+	if err != nil {
+		return nil, err
+	}
+	return ParseInfoReplication(s), nil
+}
+
+func (c *RedisClient) PeerInfoReplication(ctx context.Context, host string, port int) (*ReplicationInfo, error) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	c.peerMu.Lock()
+	if c.peer == nil || c.peerAddr != addr {
+		if c.peer != nil {
+			_ = c.peer.Close()
+		}
+		c.peer = redis.NewClient(&redis.Options{
+			Addr: addr, Password: c.password,
+			DialTimeout: c.timeout, ReadTimeout: c.timeout,
+			PoolSize: 1, MaxRetries: -1,
+		})
+		c.peerAddr = addr
+	}
+	peer := c.peer
+	c.peerMu.Unlock()
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	s, err := peer.Info(ctx, "replication").Result()
 	if err != nil {
 		return nil, err
 	}
@@ -170,18 +227,27 @@ func (c *RedisClient) SetReadOnly(ctx context.Context, readonly bool) error {
 	return nil
 }
 
-func (c *RedisClient) Close() error { return c.rdb.Close() }
+func (c *RedisClient) Close() error {
+	c.peerMu.Lock()
+	if c.peer != nil {
+		_ = c.peer.Close()
+	}
+	c.peerMu.Unlock()
+	return c.rdb.Close()
+}
 
 func isUnknownCommand(err error) bool {
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "unknown") || strings.Contains(s, "unsupported") || strings.Contains(s, "no such")
 }
 
-// ParseInfoReplication parses INFO replication output defensively.
-// Unknown replica fields -> LagBytes = -1 (unknown).
+// ParseInfoReplication parses INFO replication output from kvrocks or
+// Redis. A replica's lag is always reported unknown (-1) here because its
+// own INFO does not contain the master's offset; see the package comment.
 func ParseInfoReplication(s string) *ReplicationInfo {
-	ri := &ReplicationInfo{MasterOffset: -1, LagBytes: -1, Raw: s}
+	ri := &ReplicationInfo{LocalOffset: -1, MasterOffset: -1, LagBytes: -1, Raw: s}
 	kv := map[string]string{}
+	var slaveLines []string
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -191,7 +257,11 @@ func ParseInfoReplication(s string) *ReplicationInfo {
 		if !ok {
 			continue
 		}
-		kv[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		kv[k] = v
+		if isSlaveN(k) {
+			slaveLines = append(slaveLines, v)
+		}
 	}
 	ri.Role = kv["role"]
 	if ri.Role == "" {
@@ -201,33 +271,67 @@ func ParseInfoReplication(s string) *ReplicationInfo {
 	if p, err := strconv.Atoi(kv["master_port"]); err == nil {
 		ri.MasterPort = p
 	}
-	if st := kv["master_link_status"]; st != "" {
-		ri.MasterLinkUp = st == "up"
-	}
-	if o, err := strconv.ParseInt(kv["master_repl_offset"], 10, 64); err == nil {
-		ri.MasterOffset = o
-		ri.LocalOffset = o
-	}
-	// Replica-side offsets seen across Redis/kvrocks variants.
-	for _, k := range []string{"slave_repl_offset", "replica_repl_offset", "repl_offset"} {
-		if o, err := strconv.ParseInt(kv[k], 10, 64); err == nil {
-			ri.LocalOffset = o
-			break
-		}
-	}
+	ri.MasterLinkUp = kv["master_link_status"] == "up"
 	if n, err := strconv.Atoi(kv["connected_slaves"]); err == nil {
 		ri.ConnectedSlaves = n
 	}
-	// slave0:ip,port,offset gives the master's view; prefer explicit offsets above.
-	if ri.MasterOffset >= 0 && ri.Role == "slave" {
-		// If master offset unknown on replica, try slave0 line? It isn't present on replicas.
-		// Lag stays unknown unless master offset known.
-		if _, ok := kv["master_repl_offset"]; ok {
-			ri.LagBytes = ri.MasterOffset - ri.LocalOffset
-			if ri.LagBytes < 0 {
-				ri.LagBytes = 0
+	masterOff, masterOK := parseInt(kv["master_repl_offset"])
+	switch ri.Role {
+	case "master":
+		if masterOK {
+			ri.MasterOffset = masterOff
+			ri.LocalOffset = masterOff
+		}
+		ri.LagBytes = 0
+		for _, l := range slaveLines {
+			if rs, ok := parseSlaveLine(l); ok {
+				ri.Replicas = append(ri.Replicas, rs)
 			}
+		}
+	case "slave":
+		if o, ok := parseInt(kv["slave_repl_offset"]); ok {
+			ri.LocalOffset = o
+		} else if masterOK {
+			ri.LocalOffset = masterOff
 		}
 	}
 	return ri
+}
+
+func parseInt(s string) (int64, bool) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil
+}
+
+func isSlaveN(k string) bool {
+	if !strings.HasPrefix(k, "slave") || len(k) == len("slave") {
+		return false
+	}
+	_, err := strconv.Atoi(k[len("slave"):])
+	return err == nil
+}
+
+// parseSlaveLine parses "ip=..,port=..,offset=..[,...]" (kvrocks and
+// Redis >= 2.8 key=value form).
+func parseSlaveLine(v string) (ReplicaState, bool) {
+	var rs ReplicaState
+	ok := false
+	for _, part := range strings.Split(v, ",") {
+		k, val, found := strings.Cut(part, "=")
+		if !found {
+			continue
+		}
+		switch k {
+		case "ip":
+			rs.IP = val
+		case "port":
+			rs.Port, _ = strconv.Atoi(val)
+		case "offset":
+			if n, good := parseInt(val); good {
+				rs.Offset = n
+				ok = true
+			}
+		}
+	}
+	return rs, ok
 }

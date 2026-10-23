@@ -154,6 +154,9 @@ type fakeKV struct {
 	promotions int
 	follows    int
 	readonly   bool
+	local      int64
+	peerOffset int64
+	peerErr    error
 }
 
 func (f *fakeKV) Ping(ctx context.Context) error {
@@ -170,7 +173,15 @@ func (f *fakeKV) InfoReplication(ctx context.Context) (*kvrocks.ReplicationInfo,
 	if !f.up {
 		return nil, errString("down")
 	}
-	return &kvrocks.ReplicationInfo{Role: f.role, MasterHost: f.masterHost, MasterPort: f.masterPort, LagBytes: f.lag, MasterLinkUp: true}, nil
+	return &kvrocks.ReplicationInfo{Role: f.role, MasterHost: f.masterHost, MasterPort: f.masterPort, LagBytes: f.lag, LocalOffset: f.local, MasterLinkUp: true}, nil
+}
+func (f *fakeKV) PeerInfoReplication(ctx context.Context, h string, p int) (*kvrocks.ReplicationInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.peerErr != nil {
+		return nil, f.peerErr
+	}
+	return &kvrocks.ReplicationInfo{Role: "master", MasterOffset: f.peerOffset, LocalOffset: f.peerOffset}, nil
 }
 func (f *fakeKV) ReplicaOf(ctx context.Context, h string, p int) error {
 	f.mu.Lock()
@@ -413,5 +424,40 @@ func TestConsulErrorsToleratedUntilTTL(t *testing.T) {
 	role, host, port := kv.state()
 	if role != "slave" || host != "127.0.0.1" || port != 1 {
 		t.Fatalf("expected fence while leader unknown, got role=%s %s:%d", role, host, port)
+	}
+}
+
+func TestLagGateUsesLeaderOffsetSampledBeforeFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		peer, mine int64
+		wantLeader bool
+	}{
+		{"close behind promotes", 1000, 990, true},
+		{"far behind refuses", 1_000_000, 10, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig("kv02")
+			cfg.HoldDown = time.Hour // known lag must decide, not the hold-down
+			kv := &fakeKV{up: true, role: "slave", masterHost: "10.0.0.1", masterPort: 6666, local: tc.mine, peerOffset: tc.peer}
+			lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", 6666, "sess-kv01", 2, time.Now()), sess: "sess-kv01"}
+			c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+			defer stop()
+			time.Sleep(80 * time.Millisecond)
+			if got := c.Snapshot().LagBytes; got != tc.peer-tc.mine {
+				t.Fatalf("lag while following = %d, want %d", got, tc.peer-tc.mine)
+			}
+			// Leader dies: session released, peer unreachable.
+			kv.mu.Lock()
+			kv.peerErr = errString("connection refused")
+			kv.mu.Unlock()
+			lock.mu.Lock()
+			lock.sess = ""
+			lock.mu.Unlock()
+			time.Sleep(150 * time.Millisecond)
+			if isLeader := c.Snapshot().Role == elect.RoleLeader; isLeader != tc.wantLeader {
+				t.Fatalf("leader=%v want %v (lag %d)", isLeader, tc.wantLeader, c.Snapshot().LagBytes)
+			}
+		})
 	}
 }

@@ -102,3 +102,18 @@ func TestConsulOutageExceeded(t *testing.T) {
 		t.Fatal("never renewed must step down")
 	}
 }
+
+func TestComputeLag(t *testing.T) {
+	if got := elect.ComputeLag(100, true, 40); got != 60 {
+		t.Fatalf("got %d", got)
+	}
+	if got := elect.ComputeLag(100, true, 140); got != 0 {
+		t.Fatalf("ahead should clamp to 0, got %d", got)
+	}
+	if got := elect.ComputeLag(100, false, 40); got != -1 {
+		t.Fatalf("no sample should be unknown, got %d", got)
+	}
+	if got := elect.ComputeLag(100, true, -1); got != -1 {
+		t.Fatalf("unknown local should be unknown, got %d", got)
+	}
+}

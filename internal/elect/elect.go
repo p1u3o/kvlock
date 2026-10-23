@@ -125,3 +125,17 @@ func Classify(holder, mySession string) LockState {
 func ConsulOutageExceeded(lastRenew, now time.Time, ttl time.Duration) bool {
 	return lastRenew.IsZero() || now.Sub(lastRenew) >= ttl
 }
+
+// ComputeLag returns how far local is behind the leader, using the leader's
+// offset as last sampled. -1 means unknown (no sample, or local unknown).
+// A sample is a lower bound on the leader's progress, so the result can
+// underestimate lag by whatever the leader wrote after it was taken.
+func ComputeLag(leaderOffset int64, haveSample bool, localOffset int64) int64 {
+	if !haveSample || leaderOffset < 0 || localOffset < 0 {
+		return -1
+	}
+	if d := leaderOffset - localOffset; d > 0 {
+		return d
+	}
+	return 0
+}

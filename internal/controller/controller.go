@@ -50,13 +50,19 @@ type Controller struct {
 	lastRenewOK time.Time
 	// lastConsulOK is the last time any Consul call succeeded.
 	lastConsulOK time.Time
+	// Leader's master_repl_offset as last sampled while it was reachable,
+	// and which leader session it belongs to. Used by the lag gate after
+	// the leader disappears.
+	peerOffset  int64
+	peerSampled bool
+	peerSession string
 
 	rng *rand.Rand
 }
 
 // New builds a controller.
 func New(cfg *config.Config, deps Deps, log *logx.Logger, reg *metrics.Registry) *Controller {
-	c := &Controller{cfg: cfg, deps: deps, log: log, reg: reg, role: elect.RoleUnknown, lag: -1, rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
+	c := &Controller{cfg: cfg, deps: deps, log: log, reg: reg, role: elect.RoleUnknown, lag: -1, peerOffset: -1, rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
 	// Stable exposition from boot.
 	reg.SetGauge("is_leader", 0)
 	reg.SetGauge("kvrocks_up", 0)
@@ -225,12 +231,10 @@ func (c *Controller) tick(ctx context.Context) {
 	} else {
 		c.kvUp = true
 		c.unhealthy = 0
-		c.lag = ri.LagBytes
 	}
 	unhealthy := c.unhealthy
 	c.mu.Unlock()
 	c.reg.SetGauge("kvrocks_up", boolToInt(c.Snapshot().KvrocksUp))
-	c.reg.SetGauge("replication_lag_bytes", c.Snapshot().LagBytes)
 
 	if perr != nil {
 		c.log.Warn("kvrocks unhealthy", map[string]any{"streak": unhealthy, "error": perr.Error()})
@@ -270,6 +274,47 @@ func (c *Controller) tick(ctx context.Context) {
 	c.lastConsulOK = time.Now()
 	c.mu.Unlock()
 	c.evaluate(ctx, ri, raw, holder, sid)
+	c.reg.SetGauge("replication_lag_bytes", c.Snapshot().LagBytes)
+}
+
+// sampleLeader records the leader's replication offset so the lag gate has
+// something to compare against if the leader later disappears.
+func (c *Controller) sampleLeader(ctx context.Context, holder string, target *consulstore.LeaderValue) {
+	c.mu.Lock()
+	if c.peerSession != holder {
+		c.peerSession = holder
+		c.peerSampled = false
+		c.peerOffset = -1
+	}
+	c.mu.Unlock()
+	if target == nil {
+		return
+	}
+	pctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+	defer cancel()
+	pi, err := c.deps.KV.PeerInfoReplication(pctx, target.Addr, target.Port)
+	if err != nil {
+		c.log.Warn("could not sample leader replication offset", map[string]any{"error": err.Error(), "leader": target.Node})
+		return
+	}
+	if pi.Role != "master" || pi.MasterOffset < 0 {
+		return
+	}
+	c.mu.Lock()
+	c.peerOffset = pi.MasterOffset
+	c.peerSampled = true
+	c.mu.Unlock()
+}
+
+// updateLag recomputes our lag behind the (last known) leader.
+func (c *Controller) updateLag(ri *kvrocks.ReplicationInfo) {
+	local := int64(-1)
+	if ri != nil {
+		local = ri.LocalOffset
+	}
+	c.mu.Lock()
+	c.lag = elect.ComputeLag(c.peerOffset, c.peerSampled, local)
+	c.mu.Unlock()
 }
 
 // evaluate applies one election step given the lock state read from Consul.
@@ -279,6 +324,7 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 	case elect.LockMine:
 		c.mu.Lock()
 		c.leader = lv
+		c.lag = 0
 		c.mu.Unlock()
 		c.onSelfLeader(ctx, ri)
 	case elect.LockVacant:
@@ -288,12 +334,20 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 		if lv != nil && lv.Session != sid {
 			c.lastLeader = lv
 		}
+		if c.lastLeader != nil && c.lastLeaderSeen.IsZero() {
+			// We never saw it holding the lock (e.g. we just started), so
+			// start the hold-down clock now, once.
+			c.lastLeaderSeen = time.Now()
+		}
 		old := c.lastLeader
 		seen := c.lastLeaderSeen
 		c.mu.Unlock()
 		if c.isLeader() {
 			c.demote(ctx, "lock no longer held", nil)
 		}
+		// Keep the last sample from the departed leader: that is exactly
+		// what the lag gate needs now.
+		c.updateLag(ri)
 		c.tryBecomeLeader(ctx, raw, ri, old, seen)
 	default: // held by another session
 		c.mu.Lock()
@@ -303,6 +357,8 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 			c.lastLeaderSeen = time.Now()
 		}
 		c.mu.Unlock()
+		c.sampleLeader(ctx, holder, c.followTarget(lv))
+		c.updateLag(ri)
 		c.onFollow(ctx, ri, lv)
 	}
 }
@@ -403,10 +459,9 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		}
 	}
 	epoch := elect.NextEpoch(raw)
-	lag := int64(-1)
-	if ri != nil {
-		lag = ri.LagBytes
-	}
+	c.mu.RLock()
+	lag := c.lag
+	c.mu.RUnlock()
 	// Determine old-master recency: if key empty, no old master.
 	haveOld := oldMaster != nil
 	lastSeen := oldSeen
