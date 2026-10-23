@@ -60,3 +60,25 @@ func TestKVKind(t *testing.T) {
 		t.Fatal("expected error for bogus kind")
 	}
 }
+
+func TestMaxLagDefaultsFollowBackendUnits(t *testing.T) {
+	c, err := config.Parse([]string{})
+	if err != nil || c.MaxLagBytes != 1000 {
+		t.Fatalf("kvrocks default: %d %v", c.MaxLagBytes, err)
+	}
+	c, err = config.Parse([]string{"--kv-kind=redis"})
+	if err != nil || c.MaxLagBytes != 104857600 {
+		t.Fatalf("redis default: %d %v", c.MaxLagBytes, err)
+	}
+	c, err = config.Parse([]string{"--max-lag-bytes=7"})
+	if err != nil || c.MaxLagBytes != 7 || c.HandoverMaxLag != 7 {
+		t.Fatalf("old flag: %d %v", c.MaxLagBytes, err)
+	}
+	c, err = config.Parse([]string{"--max-lag=0"})
+	if err != nil || c.MaxLagBytes != 0 {
+		t.Fatalf("zero: %d %v", c.MaxLagBytes, err)
+	}
+	if c.EpochKey() != "kvrocks/main/epoch" {
+		t.Fatalf("epoch key %q", c.EpochKey())
+	}
+}

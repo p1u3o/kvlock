@@ -164,7 +164,8 @@ func Parse(args []string) (*Config, error) {
 	fs.DurationVar(&c.LockDelay, "lock-delay", getenvDur("LOCK_DELAY", 1*time.Second), "Consul lock delay ($LOCK_DELAY)")
 	fs.IntVar(&c.UnhealthyThreshold, "unhealthy-threshold", getenvInt("UNHEALTHY_THRESHOLD", 3), "Consecutive failed kvrocks checks before releasing lock ($UNHEALTHY_THRESHOLD)")
 
-	fs.Int64Var(&c.MaxLagBytes, "max-lag-bytes", getenvInt64("MAX_LAG_BYTES", 104857600), "Max replication lag bytes tolerated before refusing promotion ($MAX_LAG_BYTES)")
+	fs.Int64Var(&c.MaxLagBytes, "max-lag", getenvInt64("MAX_LAG", getenvInt64("MAX_LAG_BYTES", -1)), "Max replication lag tolerated before refusing promotion, in the backend's offset units: write sequence numbers for kvrocks (default 1000), bytes for Redis (default 100MiB) ($MAX_LAG)")
+	fs.Int64Var(&c.MaxLagBytes, "max-lag-bytes", c.MaxLagBytes, "Old name for --max-lag ($MAX_LAG_BYTES)")
 	fs.DurationVar(&c.HoldDown, "hold-down", getenvDur("HOLD_DOWN", 30*time.Second), "Promote with unknown lag only if old master unreachable this long ($HOLD_DOWN)")
 
 	fs.StringVar(&c.ProxyAddr, "proxy-addr", getenv("PROXY_ADDR", ""), "Listen address for the TCP leader proxy, e.g. :6380 ($PROXY_ADDR, default: disabled)")
@@ -247,6 +248,14 @@ func Parse(args []string) (*Config, error) {
 	if c.FencePort == c.KvrocksPort && (c.FenceHost == c.KvrocksAddr || c.FenceHost == "127.0.0.1" || c.FenceHost == "localhost") {
 		return nil, fmt.Errorf("--fence-host/--fence-port must not point at the local instance")
 	}
+	if c.MaxLagBytes < 0 {
+		// kvrocks offsets count writes, not bytes; a byte-sized default
+		// would let a replica that is missing almost everything promote.
+		c.MaxLagBytes = 1000
+		if c.KVKind == "redis" {
+			c.MaxLagBytes = 104857600
+		}
+	}
 	if c.HandoverMaxLag < 0 {
 		c.HandoverMaxLag = c.MaxLagBytes
 	}
@@ -266,6 +275,13 @@ func (c *Config) LeaderKey() string {
 		return "kvrocks/" + c.Cluster + "/observe/leader"
 	}
 	return "kvrocks/" + c.Cluster + "/leader"
+}
+
+// EpochKey is where the monotonic epoch counter lives, next to the
+// leader key.
+func (c *Config) EpochKey() string {
+	k := c.LeaderKey() // always ends in "leader"
+	return k[:len(k)-len("leader")] + "epoch"
 }
 
 func bytesTrim(b []byte) []byte {

@@ -48,8 +48,17 @@ Each sidecar runs next to its local kvrocks and loops every
    (session gone) demotes immediately.
 8. **Release**: lock release uses Consul's `?release=<session>`, which is
    atomic and only succeeds if our session still holds the key.
-9. **Shutdown**: SIGTERM removes the master registration and releases the
-   lock immediately (fast handover); followers just deregister.
+9. **Shutdown**: SIGTERM removes the master registration, fences the local
+   instance (REPLICAOF the fence target, confirmed with INFO), drops client
+   connections and only then releases the lock, so the next leader never
+   overlaps with this one. If fencing fails the lock is left to expire with
+   the session. Followers just deregister. Give the task a kill timeout of
+   at least 10s.
+   A non-leader whose instance comes back after a restart or a failed fence
+   is fenced within ~250ms; booting kvrocks with `replicaof <fence-host>
+   <fence-port>` in its config closes the remaining gap.
+   Epochs come from a counter key next to the lock (`kvrocks/<cluster>/epoch`)
+   that is only ever increased, and releasing the lock keeps its value.
 10. **Flapping**: capped exponential backoff with jitter between
     elections. `--min-leader-time` (default 0 = off): a new leader keeps
     renewing and holds the lock through local health failures until it has
@@ -75,8 +84,10 @@ Checked against the kvrocks 2.11 source (`GetReplicationInfo`):
 - Master: `role:master`, `connected_slaves`,
   `slaveN:ip=..,port=..,offset=..,lag=..`, `master_repl_offset`.
 - Offsets are RocksDB sequence numbers, **not bytes**. With kvrocks
-  `--max-lag-bytes` is therefore a sequence-number delta (roughly a write
-  count); with Redis it is bytes.
+  `--max-lag` (old name `--max-lag-bytes`) is therefore a sequence-number
+  delta, roughly a write count, and defaults to 1000; with Redis it is
+  bytes and defaults to 100MiB. One large value is one sequence number, so
+  keep the bound small if values are big.
 - Read-only flag is `slave-read-only` (default yes).
 - `REPLICAOF host port` is async: it returns OK even when host is
   unreachable, which is what makes the fence target work.
@@ -127,9 +138,9 @@ a Nomad sidecar so it is restarted with kvrocks.
 | Nodes partitioned from each other, both reach Consul | Lock stays with current holder; other side's gate refuses (old master recently seen) until hold-down | no failover (correct) |
 | Consul restarted / outage shorter than TTL | Errors tolerated, leader keeps the lock, renew succeeds on return | no failover |
 | Consul outage longer than TTL | Leader fences itself; sessions re-created on return; re-election with backoff | ~outage + seconds |
-| SIGTERM on leader | Deregister + release synchronously | ~1–2s |
+| SIGTERM on leader | Deregister, fence, kill clients, release | ~1–2s |
 | Both start simultaneously | Empty key race; Consul acquire is atomic — one wins, epoch 1 | ~seconds |
-| Replica far behind (`lag > --max-lag-bytes`) | Promotion refused, stays follower, warns; retries each tick | operator must resync |
+| Replica far behind (`lag > --max-lag`) | Promotion refused, stays follower, warns; retries each tick | operator must resync |
 | Lag unknown + old master recently seen | Refused until `--hold-down` (default 30s) elapses | ≤ hold-down |
 
 ## Running
