@@ -8,11 +8,11 @@ import (
 	"net"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/consulstore"
-	"github.com/example/kvrocks-leader/internal/elect"
-	"github.com/example/kvrocks-leader/internal/httpapi"
-	"github.com/example/kvrocks-leader/internal/kvrocks"
-	"github.com/example/kvrocks-leader/internal/metrics"
+	"github.com/p1u3o/kvlock/internal/consulstore"
+	"github.com/p1u3o/kvlock/internal/elect"
+	"github.com/p1u3o/kvlock/internal/httpapi"
+	"github.com/p1u3o/kvlock/internal/kvrocks"
+	"github.com/p1u3o/kvlock/internal/metrics"
 )
 
 var errNotLeader = errors.New("this node is not the leader")

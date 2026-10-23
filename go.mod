@@ -1,4 +1,4 @@
-module github.com/example/kvrocks-leader
+module github.com/p1u3o/kvlock
 
 go 1.23.8
 

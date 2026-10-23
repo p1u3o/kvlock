@@ -3,10 +3,10 @@ package main
 import (
 	"net"
 
-	"github.com/example/kvrocks-leader/internal/controller"
-	"github.com/example/kvrocks-leader/internal/logx"
-	"github.com/example/kvrocks-leader/internal/metrics"
-	"github.com/example/kvrocks-leader/internal/proxy"
+	"github.com/p1u3o/kvlock/internal/controller"
+	"github.com/p1u3o/kvlock/internal/logx"
+	"github.com/p1u3o/kvlock/internal/metrics"
+	"github.com/p1u3o/kvlock/internal/proxy"
 )
 
 type proxyViewer interface {

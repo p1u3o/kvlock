@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/example/kvrocks-leader/internal/resp"
+	"github.com/p1u3o/kvlock/internal/resp"
 )
 
 func TestReadCommand(t *testing.T) {

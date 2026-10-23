@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/elect"
+	"github.com/p1u3o/kvlock/internal/elect"
 )
 
 func TestLagGate(t *testing.T) {

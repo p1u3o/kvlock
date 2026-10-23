@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/consulstore"
-	"github.com/example/kvrocks-leader/internal/kvrocks"
+	"github.com/p1u3o/kvlock/internal/consulstore"
+	"github.com/p1u3o/kvlock/internal/kvrocks"
 )
 
 // Role is the sidecar's current role.

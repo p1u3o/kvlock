@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/kvrocks"
-	"github.com/example/kvrocks-leader/internal/resp"
+	"github.com/p1u3o/kvlock/internal/kvrocks"
+	"github.com/p1u3o/kvlock/internal/resp"
 )
 
 // fakeServer answers just enough of the protocol for go-redis to connect

@@ -8,7 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/example/kvrocks-leader/internal/metrics"
+	"github.com/p1u3o/kvlock/internal/metrics"
 )
 
 func TestExposition(t *testing.T) {

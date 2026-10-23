@@ -5,9 +5,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/example/kvrocks-leader/internal/elect"
-	"github.com/example/kvrocks-leader/internal/httpapi"
-	"github.com/example/kvrocks-leader/internal/metrics"
+	"github.com/p1u3o/kvlock/internal/elect"
+	"github.com/p1u3o/kvlock/internal/httpapi"
+	"github.com/p1u3o/kvlock/internal/metrics"
 )
 
 type stub struct {

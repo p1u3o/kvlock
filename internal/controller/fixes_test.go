@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/consulstore"
-	"github.com/example/kvrocks-leader/internal/controller"
-	"github.com/example/kvrocks-leader/internal/elect"
-	"github.com/example/kvrocks-leader/internal/logx"
-	"github.com/example/kvrocks-leader/internal/metrics"
+	"github.com/p1u3o/kvlock/internal/consulstore"
+	"github.com/p1u3o/kvlock/internal/controller"
+	"github.com/p1u3o/kvlock/internal/elect"
+	"github.com/p1u3o/kvlock/internal/logx"
+	"github.com/p1u3o/kvlock/internal/metrics"
 )
 
 func epochOf(t *testing.T, raw []byte) uint64 {

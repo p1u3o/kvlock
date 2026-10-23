@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/example/kvrocks-leader/internal/elect"
-	"github.com/example/kvrocks-leader/internal/metrics"
+	"github.com/p1u3o/kvlock/internal/elect"
+	"github.com/p1u3o/kvlock/internal/metrics"
 )
 
 // Snapshot is served at /status.

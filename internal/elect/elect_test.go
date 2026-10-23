@@ -1,13 +1,13 @@
 package elect_test
 
 import (
-	"github.com/example/kvrocks-leader/internal/consulstore"
-	"github.com/example/kvrocks-leader/internal/kvrocks"
+	"github.com/p1u3o/kvlock/internal/consulstore"
+	"github.com/p1u3o/kvlock/internal/kvrocks"
 	"math/rand"
 	"testing"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/elect"
+	"github.com/p1u3o/kvlock/internal/elect"
 )
 
 func TestShouldPromoteWithinLag(t *testing.T) {

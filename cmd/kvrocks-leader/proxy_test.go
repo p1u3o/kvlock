@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/example/kvrocks-leader/internal/controller"
+	"github.com/p1u3o/kvlock/internal/controller"
 )
 
 type fixedView struct{ v controller.ProxyView }

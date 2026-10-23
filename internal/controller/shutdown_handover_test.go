@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/controller"
-	"github.com/example/kvrocks-leader/internal/elect"
-	"github.com/example/kvrocks-leader/internal/kvrocks"
+	"github.com/p1u3o/kvlock/internal/controller"
+	"github.com/p1u3o/kvlock/internal/elect"
+	"github.com/p1u3o/kvlock/internal/kvrocks"
 )
 
 func shutdownWithReplicas(t *testing.T, wait time.Duration, local int64, replicas []kvrocks.ReplicaState) (*fakeLock, *fakeKV, time.Duration) {

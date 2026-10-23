@@ -9,12 +9,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/example/kvrocks-leader/internal/config"
-	"github.com/example/kvrocks-leader/internal/controller"
-	"github.com/example/kvrocks-leader/internal/elect"
-	"github.com/example/kvrocks-leader/internal/kvrocks"
-	"github.com/example/kvrocks-leader/internal/logx"
-	"github.com/example/kvrocks-leader/internal/metrics"
+	"github.com/p1u3o/kvlock/internal/config"
+	"github.com/p1u3o/kvlock/internal/controller"
+	"github.com/p1u3o/kvlock/internal/elect"
+	"github.com/p1u3o/kvlock/internal/kvrocks"
+	"github.com/p1u3o/kvlock/internal/logx"
+	"github.com/p1u3o/kvlock/internal/metrics"
 )
 
 // --- fakes ---

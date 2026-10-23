@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/example/kvrocks-leader/internal/httpapi"
+	"github.com/p1u3o/kvlock/internal/httpapi"
 )
 
 func TestHandoverCommandSendsRequest(t *testing.T) {

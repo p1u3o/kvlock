@@ -7,12 +7,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/example/kvrocks-leader/internal/consulstore"
-	"github.com/example/kvrocks-leader/internal/controller"
-	"github.com/example/kvrocks-leader/internal/elect"
-	"github.com/example/kvrocks-leader/internal/httpapi"
-	"github.com/example/kvrocks-leader/internal/kvrocks"
-	"github.com/example/kvrocks-leader/internal/metrics"
+	"github.com/p1u3o/kvlock/internal/consulstore"
+	"github.com/p1u3o/kvlock/internal/controller"
+	"github.com/p1u3o/kvlock/internal/elect"
+	"github.com/p1u3o/kvlock/internal/httpapi"
+	"github.com/p1u3o/kvlock/internal/kvrocks"
+	"github.com/p1u3o/kvlock/internal/metrics"
 )
 
 func leaderWith(t *testing.T, replicas []kvrocks.ReplicaState, local int64) (*controller.Controller, *fakeLock, *fakeKV, func()) {

@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/elect"
+	"github.com/p1u3o/kvlock/internal/elect"
 )
 
 // ProxyView is what the leader proxies route on.

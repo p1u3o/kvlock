@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/config"
+	"github.com/p1u3o/kvlock/internal/config"
 )
 
 func TestDefaults(t *testing.T) {

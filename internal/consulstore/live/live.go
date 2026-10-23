@@ -11,7 +11,7 @@ import (
 
 	consul "github.com/hashicorp/consul/api"
 
-	"github.com/example/kvrocks-leader/internal/consulstore"
+	"github.com/p1u3o/kvlock/internal/consulstore"
 )
 
 // Client bundles session, lock and registrar over one *consul.Client.

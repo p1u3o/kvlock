@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/controller"
-	"github.com/example/kvrocks-leader/internal/elect"
+	"github.com/p1u3o/kvlock/internal/controller"
+	"github.com/p1u3o/kvlock/internal/elect"
 )
 
 // A replica far behind refuses at first, then promotes once the old leader

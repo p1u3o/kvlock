@@ -9,15 +9,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/config"
-	"github.com/example/kvrocks-leader/internal/consulstore/live"
-	"github.com/example/kvrocks-leader/internal/controller"
-	"github.com/example/kvrocks-leader/internal/httpapi"
-	"github.com/example/kvrocks-leader/internal/kvrocks"
-	"github.com/example/kvrocks-leader/internal/logx"
-	"github.com/example/kvrocks-leader/internal/metrics"
-	"github.com/example/kvrocks-leader/internal/proxy"
-	"github.com/example/kvrocks-leader/internal/sentinel"
+	"github.com/p1u3o/kvlock/internal/config"
+	"github.com/p1u3o/kvlock/internal/consulstore/live"
+	"github.com/p1u3o/kvlock/internal/controller"
+	"github.com/p1u3o/kvlock/internal/httpapi"
+	"github.com/p1u3o/kvlock/internal/kvrocks"
+	"github.com/p1u3o/kvlock/internal/logx"
+	"github.com/p1u3o/kvlock/internal/metrics"
+	"github.com/p1u3o/kvlock/internal/proxy"
+	"github.com/p1u3o/kvlock/internal/sentinel"
 )
 
 func main() {

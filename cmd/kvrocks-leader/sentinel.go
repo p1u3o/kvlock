@@ -5,10 +5,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/config"
-	"github.com/example/kvrocks-leader/internal/consulstore"
-	"github.com/example/kvrocks-leader/internal/consulstore/live"
-	"github.com/example/kvrocks-leader/internal/sentinel"
+	"github.com/p1u3o/kvlock/internal/config"
+	"github.com/p1u3o/kvlock/internal/consulstore"
+	"github.com/p1u3o/kvlock/internal/consulstore/live"
+	"github.com/p1u3o/kvlock/internal/sentinel"
 )
 
 type leaderSource interface {

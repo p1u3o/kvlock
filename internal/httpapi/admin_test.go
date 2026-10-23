@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	. "github.com/example/kvrocks-leader/internal/httpapi"
-	"github.com/example/kvrocks-leader/internal/metrics"
+	. "github.com/p1u3o/kvlock/internal/httpapi"
+	"github.com/p1u3o/kvlock/internal/metrics"
 )
 
 type stubHandover struct {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/httpapi"
+	"github.com/p1u3o/kvlock/internal/httpapi"
 )
 
 // runHandover implements `kvrocks-leader handover`: it asks the sidecar on

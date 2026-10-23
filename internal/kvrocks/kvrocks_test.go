@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/kvrocks"
+	"github.com/p1u3o/kvlock/internal/kvrocks"
 )
 
 // Captured shape of kvrocks 2.11 INFO replication (Server::GetReplicationInfo).

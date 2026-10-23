@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/consulstore"
+	"github.com/p1u3o/kvlock/internal/consulstore"
 )
 
 type recorded struct {

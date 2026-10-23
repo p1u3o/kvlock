@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/kvrocks-leader/internal/resp"
+	"github.com/p1u3o/kvlock/internal/resp"
 )
 
 // Master is the current lock holder as clients should see it.
