@@ -68,3 +68,25 @@ func TestObserveReplicaOfOtherHostHasNoSideEffects(t *testing.T) {
 	runCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: reg, KV: kv}, 200*time.Millisecond)
 	assertNoSideEffects(t, kv, reg)
 }
+
+// A linked replica must not take a never-held lock: the master's node
+// should win, otherwise observe reports (and active would do) a promotion
+// of the replica.
+func TestLinkedReplicaDoesNotBootstrapLeadership(t *testing.T) {
+	for _, mode := range []string{"observe", "active"} {
+		cfg := testConfig("kv02")
+		cfg.Mode = mode
+		kv := &fakeKV{up: true, role: "slave", masterHost: "10.0.0.9", masterPort: 6666}
+		lock := &fakeLock{}
+		c, _, _, _ := runCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv}, 200*time.Millisecond)
+		if c.Snapshot().Role == elect.RoleLeader {
+			t.Fatalf("%s: linked replica took the lock", mode)
+		}
+		lock.mu.Lock()
+		held := lock.sess != ""
+		lock.mu.Unlock()
+		if held {
+			t.Fatalf("%s: lock held", mode)
+		}
+	}
+}

@@ -555,6 +555,14 @@ func (c *Controller) isFenced(ri *kvrocks.ReplicationInfo) bool {
 }
 
 func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrocks.ReplicationInfo, oldMaster *consulstore.LeaderValue, oldSeen time.Time) {
+	// Bootstrap next to a running pair: with no leader ever recorded, a
+	// replica that is still linked to a live master must leave the lock to
+	// the master's node instead of racing for it.
+	if len(raw) == 0 && ri != nil && ri.Role == "slave" && ri.MasterLinkUp {
+		c.setRole(elect.RoleFollower)
+		c.observeLog("not running for leader: local instance replicates from a live master", map[string]any{"master_host": ri.MasterHost, "master_port": ri.MasterPort})
+		return
+	}
 	// Flapping guard: backoff with jitter between attempts.
 	c.mu.RLock()
 	n := c.elections
