@@ -185,6 +185,7 @@ type fakeKV struct {
 	hang      bool  // InfoReplication blocks until the context ends
 	rsidCalls int
 	rsidOK    int
+	setRO     int
 }
 
 func (f *fakeKV) downError() error {
@@ -266,6 +267,7 @@ func (f *fakeKV) SetReadOnly(ctx context.Context, ro bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.readonly = ro
+	f.setRO++
 	return nil
 }
 func (f *fakeKV) Close() error { return nil }

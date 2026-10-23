@@ -4,6 +4,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"net"
@@ -32,10 +33,12 @@ type Deps struct {
 
 // Controller owns runtime state.
 type Controller struct {
-	cfg  *config.Config
-	deps Deps
-	log  *logx.Logger
-	reg  *metrics.Registry
+	obsMu   sync.Mutex
+	obsSeen map[string]time.Time // observe decisions already logged
+	cfg     *config.Config
+	deps    Deps
+	log     *logx.Logger
+	reg     *metrics.Registry
 
 	mu            sync.RWMutex
 	role          elect.Role
@@ -623,12 +626,9 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	}
 	value := elect.MarshalLeader(c.cfg.NodeName, c.cfg.AdvertiseAddr, c.cfg.AdvertiseAddrPrivate, c.cfg.AdvertisePort, c.sessionIDValue(), epoch, time.Now())
 	if c.cfg.Mode == "observe" {
-		c.log.Info("observe: would acquire lock and promote", map[string]any{"epoch": epoch, "lag": lag})
-		c.mu.Lock()
-		c.elections++
-		c.mu.Unlock()
-		c.reg.Elections.Inc()
-		return
+		// The observe lock lives under its own prefix, so taking it only
+		// elects an observer; promote below just logs what it would do.
+		c.observeLog("observe: would acquire the real lock and promote", map[string]any{"epoch": epoch, "lag": lag})
 	}
 	c.mu.Lock()
 	sid := c.sessionID
@@ -668,7 +668,7 @@ func (c *Controller) sessionIDValue() string {
 
 func (c *Controller) promote(ctx context.Context) {
 	if c.cfg.Mode == "observe" {
-		c.log.Info("observe: would REPLICAOF NO ONE + register master", nil)
+		c.observeLog("observe: would REPLICAOF NO ONE + register master", nil)
 		return
 	}
 	pctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
@@ -682,7 +682,7 @@ func (c *Controller) promote(ctx context.Context) {
 
 func (c *Controller) followLeader(ctx context.Context, lv *consulstore.LeaderValue) {
 	if c.cfg.Mode == "observe" {
-		c.log.Info("observe: would REPLICAOF leader + register replica", map[string]any{"leader": lv.Node, "addr": lv.Addr, "port": lv.Port})
+		c.observeLog("observe: would REPLICAOF leader + register replica", map[string]any{"leader": lv.Node, "addr": lv.Addr, "port": lv.Port})
 		return
 	}
 	fctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
@@ -718,7 +718,7 @@ func (c *Controller) demote(ctx context.Context, label, reason string, target *c
 	c.reg.StepDowns.WithLabelValues(label).Inc()
 	c.log.Warn("demoting", map[string]any{"reason": reason})
 	if c.cfg.Mode == "observe" {
-		c.log.Info("observe: would demote (remove master registration, REPLICAOF leader or fence target)", nil)
+		c.observeLog("observe: would demote (remove master registration, REPLICAOF leader or fence target)", nil)
 		c.setRole(elect.RoleFollower)
 		return
 	}
@@ -744,7 +744,7 @@ func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue)
 		host, port, kind = target.Addr, target.Port, "leader"
 	}
 	if c.cfg.Mode == "observe" {
-		c.log.Info("observe: would fence with REPLICAOF", map[string]any{"host": host, "port": port})
+		c.observeLog("observe: would fence with REPLICAOF", map[string]any{"host": host, "port": port})
 		return false
 	}
 	kctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
@@ -812,7 +812,7 @@ func (c *Controller) killClients(ctx context.Context) {
 
 func (c *Controller) registerMaster(ctx context.Context) {
 	if c.cfg.Mode == "observe" {
-		c.log.Info("observe: would register master service", map[string]any{"service": c.cfg.ServiceName, "tag": c.cfg.MasterTag})
+		c.observeLog("observe: would register master service", map[string]any{"service": c.cfg.ServiceName, "tag": c.cfg.MasterTag})
 		return
 	}
 	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -1034,6 +1034,11 @@ func (c *Controller) onBackendBack(ctx context.Context) {
 // ensureRsIDPsync applies use-rsid-psync once (best effort). If the local
 // instance is not reachable yet it stays pending without a warning.
 func (c *Controller) ensureRsIDPsync(ctx context.Context) {
+	if c.cfg.Mode == "observe" {
+		c.rsidDone = true
+		c.observeLog("observe: would ensure use-rsid-psync", nil)
+		return
+	}
 	tctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
 	defer cancel()
 	err := c.deps.KV.EnsureRsIDPsync(tctx)
@@ -1067,3 +1072,24 @@ func minDur(a, b time.Duration) time.Duration {
 	}
 	return b
 }
+
+// observeLog logs an observe-mode decision, repeating an identical one at
+// most every observeRepeat so a steady state does not flood the logs.
+func (c *Controller) observeLog(msg string, fields map[string]any) {
+	key := msg + fmt.Sprint(fields)
+	now := time.Now()
+	c.obsMu.Lock()
+	if c.obsSeen == nil {
+		c.obsSeen = map[string]time.Time{}
+	}
+	last, seen := c.obsSeen[key]
+	if seen && now.Sub(last) < observeRepeat {
+		c.obsMu.Unlock()
+		return
+	}
+	c.obsSeen[key] = now
+	c.obsMu.Unlock()
+	c.log.Info(msg, fields)
+}
+
+const observeRepeat = 5 * time.Minute
