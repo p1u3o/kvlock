@@ -3,6 +3,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"sync"
 	"time"
@@ -44,6 +45,11 @@ type Controller struct {
 	leaderChanges  uint64
 	lastLeader     *consulstore.LeaderValue
 	lastLeaderSeen time.Time
+	// lastRenewOK is the last time Consul confirmed our session (create or
+	// renew). The leader tolerates Consul errors until ~SessionTTL past it.
+	lastRenewOK time.Time
+	// lastConsulOK is the last time any Consul call succeeded.
+	lastConsulOK time.Time
 
 	rng *rand.Rand
 }
@@ -145,9 +151,12 @@ func (c *Controller) ensureSession(ctx context.Context) {
 		c.log.Warn("session create failed", map[string]any{"error": err.Error()})
 		return
 	}
+	now := time.Now()
 	c.mu.Lock()
 	c.sessionID = id
 	c.sessionValid = true
+	c.lastRenewOK = now
+	c.lastConsulOK = now
 	c.mu.Unlock()
 	c.log.Info("session created", map[string]any{"ttl": c.cfg.SessionTTL.String()})
 }
@@ -168,17 +177,31 @@ func (c *Controller) renewSession(ctx context.Context) {
 		return
 	}
 	if err := c.deps.Session.Renew(ctx, sid); err != nil {
-		c.log.Warn("session renew failed", map[string]any{"error": err.Error()})
-		c.mu.Lock()
-		c.sessionValid = false
-		c.mu.Unlock()
-		if c.isLeader() {
-			c.demote(ctx, "session renew failed")
+		if errors.Is(err, consulstore.ErrSessionInvalid) {
+			// Consul answered: the session (and any lock) is gone. No
+			// point waiting; step down now and let the next tick make a
+			// fresh session.
+			c.log.Warn("session invalidated", nil)
+			c.mu.Lock()
+			if c.sessionID == sid {
+				c.sessionID = ""
+			}
+			c.sessionValid = false
+			c.lastConsulOK = time.Now()
+			c.mu.Unlock()
+			if c.isLeader() {
+				c.demote(ctx, "session invalidated", nil)
+			}
+			return
 		}
+		c.onConsulError(ctx, err)
 		return
 	}
+	now := time.Now()
 	c.mu.Lock()
 	c.sessionValid = true
+	c.lastRenewOK = now
+	c.lastConsulOK = now
 	c.mu.Unlock()
 }
 
@@ -215,7 +238,7 @@ func (c *Controller) tick(ctx context.Context) {
 			// Stop renewing (renewSession gates on kvUp next round) and
 			// proactively release + demote if leader.
 			if c.isLeader() {
-				c.demote(ctx, "kvrocks unhealthy")
+				c.demote(ctx, "kvrocks unhealthy", nil)
 				c.releaseSession(ctx)
 			} else {
 				c.releaseSession(ctx)
@@ -234,36 +257,54 @@ func (c *Controller) tick(ctx context.Context) {
 		return
 	}
 
-	// 2. Read current leader.
-	raw, sess, idx, err := c.deps.Lock.Get(ctx, c.cfg.LeaderKey())
-	_ = idx
+	// 2. Read current leader. Leadership is decided by which session holds
+	// the key, never by the node name in the value: the value survives a
+	// session release (behavior=release keeps it) and a restarted sidecar
+	// on the same node has a different session.
+	raw, holder, _, err := c.deps.Lock.Get(ctx, c.cfg.LeaderKey())
 	if err != nil {
 		c.onConsulError(ctx, err)
 		return
 	}
-	lv := elect.ParseLeader(raw)
 	c.mu.Lock()
-	c.leader = lv
-	if lv != nil && lv.Node != c.cfg.NodeName {
-		c.lastLeader = lv
-		c.lastLeaderSeen = time.Now()
-	}
+	c.lastConsulOK = time.Now()
 	c.mu.Unlock()
+	c.evaluate(ctx, ri, raw, holder, sid)
+}
 
-	if lv != nil && lv.Node == c.cfg.NodeName {
+// evaluate applies one election step given the lock state read from Consul.
+func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, raw []byte, holder, sid string) {
+	lv := elect.ParseLeader(raw)
+	switch elect.Classify(holder, sid) {
+	case elect.LockMine:
+		c.mu.Lock()
+		c.leader = lv
+		c.mu.Unlock()
 		c.onSelfLeader(ctx, ri)
-		return
-	}
-	if lv == nil {
-		c.mu.RLock()
+	case elect.LockVacant:
+		c.mu.Lock()
+		c.leader = nil
+		// The value outlives the session; it names the previous leader.
+		if lv != nil && lv.Session != sid {
+			c.lastLeader = lv
+		}
 		old := c.lastLeader
 		seen := c.lastLeaderSeen
-		c.mu.RUnlock()
+		c.mu.Unlock()
+		if c.isLeader() {
+			c.demote(ctx, "lock no longer held", nil)
+		}
 		c.tryBecomeLeader(ctx, raw, ri, old, seen)
-		return
+	default: // held by another session
+		c.mu.Lock()
+		c.leader = lv
+		if lv != nil {
+			c.lastLeader = lv
+			c.lastLeaderSeen = time.Now()
+		}
+		c.mu.Unlock()
+		c.onFollow(ctx, ri, lv)
 	}
-	// Someone else leads: follow.
-	c.onFollow(ctx, ri, lv, sess)
 }
 
 func (c *Controller) probe(ctx context.Context) (*kvrocks.ReplicationInfo, error) {
@@ -273,14 +314,22 @@ func (c *Controller) probe(ctx context.Context) (*kvrocks.ReplicationInfo, error
 	return c.deps.KV.InfoReplication(ctx)
 }
 
+// onConsulError tolerates Consul errors while the session can still be
+// alive server-side. Consul only invalidates a session after its TTL
+// elapses without a renew, so the leader keeps serving until roughly one
+// TTL has passed since the last successful renewal, then steps down
+// (before the server-side release lets the other node take over).
 func (c *Controller) onConsulError(ctx context.Context, err error) {
-	c.log.Warn("consul unreachable", map[string]any{"error": err.Error()})
-	// Track outage; if longer than TTL and we are leader, demote first.
-	// Simple implementation: demote immediately on error while leader, since
-	// an isolated old master must stop advertising within ~TTL. The TTL check
-	// will also expire even if demote RPCs fail; FailTTL is best-effort.
-	if c.isLeader() {
-		c.demote(ctx, "consul unreachable")
+	c.mu.RLock()
+	last := c.lastRenewOK
+	c.mu.RUnlock()
+	since := time.Since(last)
+	c.log.Warn("consul error", map[string]any{"error": err.Error(), "since_last_renew": since.String()})
+	if !c.isLeader() {
+		return
+	}
+	if elect.ConsulOutageExceeded(last, time.Now(), c.cfg.SessionTTL) {
+		c.demote(ctx, "consul unreachable for ~session TTL", nil)
 	}
 }
 
@@ -301,23 +350,43 @@ func (c *Controller) onSelfLeader(ctx context.Context, ri *kvrocks.ReplicationIn
 	}
 }
 
-func (c *Controller) onFollow(ctx context.Context, ri *kvrocks.ReplicationInfo, lv *consulstore.LeaderValue, sess string) {
-	wasLeader := c.isLeader()
-	if wasLeader {
-		// Lost the lock (another node holds it or session invalidated).
-		c.demote(ctx, "lock lost")
+func (c *Controller) onFollow(ctx context.Context, ri *kvrocks.ReplicationInfo, lv *consulstore.LeaderValue) {
+	target := c.followTarget(lv)
+	if c.isLeader() {
+		// Lost the lock to another session.
+		c.demote(ctx, "lock held by another session", lv)
 	}
 	c.setRole(elect.RoleFollower)
 	c.reg.SetGauge("is_leader", 0)
 	c.registerReplica(ctx)
 	c.passCheck(ctx)
-	// Point at leader only when not already following it.
-	if ri != nil && !(ri.Role == "slave" && ri.MasterHost == lv.Addr && ri.MasterPort == lv.Port) {
-		c.followLeader(ctx, lv)
+	if target == nil {
+		// Holder unknown or it is a stale session of our own node (e.g. we
+		// restarted and the old session has not expired yet). We must not
+		// REPLICAOF ourselves, but we also must not stay writable.
+		if ri != nil && !c.isFenced(ri) {
+			c.fence(ctx, nil)
+		}
+		return
 	}
-	// Track master's recency for the promotion gate: store last-seen in memory
-	// via leader value? We approximate: leader key presence == recently seen.
-	_ = sess
+	if ri != nil && !(ri.Role == "slave" && ri.MasterHost == target.Addr && ri.MasterPort == target.Port) {
+		c.followLeader(ctx, target)
+	}
+}
+
+// followTarget returns where to replicate from, or nil when lv does not
+// describe another node we can follow.
+func (c *Controller) followTarget(lv *consulstore.LeaderValue) *consulstore.LeaderValue {
+	if lv == nil || lv.Node == c.cfg.NodeName || lv.Addr == "" || lv.Port == 0 {
+		return nil
+	}
+	return lv
+}
+
+// isFenced reports whether the local instance already refuses writes:
+// a replica of either some real leader or the fence target.
+func (c *Controller) isFenced(ri *kvrocks.ReplicationInfo) bool {
+	return ri.Role == "slave"
 }
 
 func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrocks.ReplicationInfo, oldMaster *consulstore.LeaderValue, oldSeen time.Time) {
@@ -351,9 +420,13 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	dec := elect.ShouldPromote(lag, c.cfg.MaxLagBytes, lastSeen, c.cfg.HoldDown, time.Now(), haveOld)
 	if !dec.Allow {
 		c.log.Warn("promotion refused by lag gate", map[string]any{"lag": lag, "reason": dec.Reason})
-		// Stay follower; keep replica registration.
+		// Stay follower; keep replica registration, and make sure we are
+		// not a writable master while nobody holds the lock.
 		c.setRole(elect.RoleFollower)
 		c.registerReplica(ctx)
+		if ri != nil && !c.isFenced(ri) {
+			c.fence(ctx, nil)
+		}
 		return
 	}
 	if dec.Reason != "lag within bound" {
@@ -381,6 +454,11 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		return
 	}
 	if !held {
+		// Someone else won; the next tick follows them. Until then refuse
+		// writes if we happen to be a master.
+		if ri != nil && !c.isFenced(ri) {
+			c.fence(ctx, nil)
+		}
 		return
 	}
 	c.promote(ctx)
@@ -427,28 +505,55 @@ func (c *Controller) followLeader(ctx context.Context, lv *consulstore.LeaderVal
 	c.log.Info("following leader", map[string]any{"leader": lv.Node})
 }
 
-func (c *Controller) demote(ctx context.Context, reason string) {
+// demote stops this node acting as master. target is the new leader if
+// known (nil otherwise).
+//
+// Ordering: remove the master advertisement first, then fence. Fencing
+// means turning the instance into a replica: replica-read-only /
+// slave-read-only only applies to replicas, so a "read-only" master would
+// still accept writes. We REPLICAOF the new leader when we know it, or a
+// deliberately unreachable fence address otherwise; either way the
+// instance becomes a read-only replica and keeps its data until it can
+// sync from a real leader.
+func (c *Controller) demote(ctx context.Context, reason string, target *consulstore.LeaderValue) {
 	c.log.Warn("demoting", map[string]any{"reason": reason})
 	if c.cfg.Mode == "observe" {
-		c.log.Info("observe: would demote (remove master registration, REPLICAOF or read-only)", nil)
+		c.log.Info("observe: would demote (remove master registration, REPLICAOF leader or fence target)", nil)
 		c.setRole(elect.RoleFollower)
 		return
 	}
 	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	// 1. Remove master advertisement FIRST (fail TTL + deregister), then
-	// make node non-writable so an isolated old master stops serving writes.
 	_ = c.deps.Registrar.FailTTL(dctx, c.deps.Registrar.CheckID(c.serviceID()))
 	_ = c.deps.Registrar.Deregister(dctx, c.serviceID())
-	kctx, kcancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
-	defer kcancel()
-	_ = c.deps.KV.SetReadOnly(kctx, true)
+	c.fence(ctx, c.followTarget(target))
 	c.setRole(elect.RoleFollower)
 	c.mu.Lock()
 	c.leaderSince = time.Time{}
 	c.mu.Unlock()
-	// Re-register as replica so clients stop routing writes here.
 	c.registerReplica(ctx)
+}
+
+// fence makes the local instance refuse writes by making it a replica of
+// target, or of the configured fence address when target is nil.
+func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue) {
+	host, port := c.cfg.FenceHost, c.cfg.FencePort
+	if target != nil {
+		host, port = target.Addr, target.Port
+	}
+	if c.cfg.Mode == "observe" {
+		c.log.Info("observe: would fence with REPLICAOF", map[string]any{"host": host, "port": port})
+		return
+	}
+	kctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+	defer cancel()
+	if err := c.deps.KV.ReplicaOf(kctx, host, port); err != nil {
+		c.reg.Inc("fence_failures_total")
+		c.log.Error("fence REPLICAOF failed; instance may still accept writes", map[string]any{"error": err.Error(), "host": host, "port": port})
+		return
+	}
+	_ = c.deps.KV.SetReadOnly(kctx, true)
+	c.log.Info("fenced: now a read-only replica", map[string]any{"host": host, "port": port, "leader_known": target != nil})
 }
 
 func (c *Controller) registerMaster(ctx context.Context) {
@@ -515,19 +620,13 @@ func (c *Controller) watchLoop(ctx context.Context) {
 			continue
 		}
 		idx = nidx
-		lv := elect.ParseLeader(raw)
 		c.mu.Lock()
-		c.leader = lv
+		if sess == "" {
+			c.leader = nil // vacant: next tick attempts election
+		} else {
+			c.leader = elect.ParseLeader(raw)
+		}
 		c.mu.Unlock()
-		if lv == nil {
-			// Key vanished: next tick will attempt election.
-			continue
-		}
-		if lv.Node == c.cfg.NodeName {
-			continue // we lead; tick handles steady state
-		}
-		_ = sess
-		// Nudge a follow check on change (tick also covers it).
 	}
 }
 

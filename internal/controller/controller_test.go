@@ -67,6 +67,7 @@ type fakeLock struct {
 	sess     string
 	idx      uint64
 	acquires int
+	getErr   error
 }
 
 func (f *fakeLock) Acquire(ctx context.Context, key, sess string, v []byte) (bool, error) {
@@ -84,15 +85,19 @@ func (f *fakeLock) Acquire(ctx context.Context, key, sess string, v []byte) (boo
 func (f *fakeLock) Release(ctx context.Context, key, sess string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Like Consul's release op: drop the session, keep the value.
 	if f.sess == sess {
-		f.val = nil
 		f.sess = ""
+		f.idx++
 	}
 	return nil
 }
 func (f *fakeLock) Get(ctx context.Context, key string) ([]byte, string, uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return nil, "", 0, f.getErr
+	}
 	return f.val, f.sess, f.idx, nil
 }
 func (f *fakeLock) Watch(ctx context.Context, key string, wi uint64, wt time.Duration) ([]byte, string, uint64, error) {
@@ -204,7 +209,7 @@ func testConfig(node string) *config.Config {
 		Cluster: "main", SessionTTL: 10 * time.Second, LockDelay: time.Second,
 		UnhealthyThreshold: 2, MaxLagBytes: 1000, HoldDown: 50 * time.Millisecond,
 		ServiceName: "kvrocks", MasterTag: "master", ReplicaTag: "replica",
-		Mode: "active", MinLeaderTime: time.Second,
+		Mode: "active", FenceHost: "127.0.0.1", FencePort: 1,
 		ReelectBaseBackoff: time.Millisecond, ReelectMaxBackoff: 5 * time.Millisecond,
 		HTTPAddr: ":0", CheckInterval: 20 * time.Millisecond,
 	}
@@ -305,5 +310,108 @@ func TestPromotionRefusedWhenFarBehind(t *testing.T) {
 	c, _, _, _ := runCtl(t, cfg, deps, 150*time.Millisecond)
 	if c.Snapshot().Role != elect.RoleLeader {
 		t.Fatal("fresh cluster should elect a leader")
+	}
+}
+
+// startCtl runs a controller until the returned stop func is called.
+func startCtl(t *testing.T, cfg *config.Config, deps controller.Deps) (*controller.Controller, func()) {
+	t.Helper()
+	c := controller.New(cfg, deps, logx.New(cfg.NodeName, cfg.Mode), metrics.New())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); c.Run(ctx) }()
+	return c, func() { cancel(); <-done }
+}
+
+func (f *fakeKV) state() (role, host string, port int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.role, f.masterHost, f.masterPort
+}
+
+func TestNodeNameAloneDoesNotGrantLeadership(t *testing.T) {
+	// The key names kv01 but is held by an old session (e.g. from before a
+	// restart). kv01's new sidecar must not treat itself as leader, must not
+	// REPLICAOF itself, and must stop being a writable master.
+	cfg := testConfig("kv01")
+	kv := &fakeKV{up: true, role: "master"}
+	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", 6666, "sess-old", 4, time.Now()), sess: "sess-old"}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+	time.Sleep(150 * time.Millisecond)
+	stop()
+	if c.Snapshot().Role == elect.RoleLeader {
+		t.Fatal("must not be leader without holding the lock with our session")
+	}
+	role, host, port := kv.state()
+	if role != "slave" || host != "127.0.0.1" || port != 1 {
+		t.Fatalf("expected fence to 127.0.0.1:1, got role=%s %s:%d", role, host, port)
+	}
+}
+
+func TestVacantKeyWithOldValueIsElectable(t *testing.T) {
+	// behavior=release leaves the value behind with no session.
+	cfg := testConfig("kv02")
+	kv := &fakeKV{up: true, role: "master", lag: 0}
+	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", 6666, "sess-old", 4, time.Now())}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+	time.Sleep(200 * time.Millisecond)
+	stop()
+	if c.Snapshot().Role != elect.RoleLeader {
+		t.Fatalf("expected to take over vacant key, got %v", c.Snapshot().Role)
+	}
+	if lv := elect.ParseLeader(lock.val); lv == nil || lv.Epoch != 5 || lv.Node != "kv02" {
+		t.Fatalf("expected epoch 5 for kv02, got %+v", lv)
+	}
+}
+
+func TestDemoteFencesByReplicatingNewLeader(t *testing.T) {
+	cfg := testConfig("kv01")
+	kv := &fakeKV{up: true, role: "master", lag: 0}
+	lock := &fakeLock{}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+	defer stop()
+	time.Sleep(100 * time.Millisecond)
+	if c.Snapshot().Role != elect.RoleLeader {
+		t.Fatal("precondition: leader")
+	}
+	lock.mu.Lock()
+	lock.sess = "sess-kv02"
+	lock.val = elect.MarshalLeader("kv02", "10.0.0.2", 6666, "sess-kv02", 9, time.Now())
+	lock.mu.Unlock()
+	time.Sleep(100 * time.Millisecond)
+	if c.Snapshot().Role != elect.RoleFollower {
+		t.Fatalf("expected follower, got %v", c.Snapshot().Role)
+	}
+	role, host, port := kv.state()
+	if role != "slave" || host != "10.0.0.2" || port != 6666 {
+		t.Fatalf("old master must become replica of new leader, got role=%s %s:%d", role, host, port)
+	}
+}
+
+func TestConsulErrorsToleratedUntilTTL(t *testing.T) {
+	cfg := testConfig("kv01")
+	cfg.SessionTTL = 400 * time.Millisecond
+	kv := &fakeKV{up: true, role: "master", lag: 0}
+	lock := &fakeLock{}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+	defer stop()
+	time.Sleep(80 * time.Millisecond)
+	if c.Snapshot().Role != elect.RoleLeader {
+		t.Fatal("precondition: leader")
+	}
+	lock.mu.Lock()
+	lock.getErr = errString("connection refused")
+	lock.mu.Unlock()
+	time.Sleep(120 * time.Millisecond)
+	if c.Snapshot().Role != elect.RoleLeader {
+		t.Fatal("a brief Consul error must not cause step-down")
+	}
+	time.Sleep(400 * time.Millisecond)
+	if c.Snapshot().Role == elect.RoleLeader {
+		t.Fatal("expected step-down once ~TTL passed without a successful renew")
+	}
+	role, host, port := kv.state()
+	if role != "slave" || host != "127.0.0.1" || port != 1 {
+		t.Fatalf("expected fence while leader unknown, got role=%s %s:%d", role, host, port)
 	}
 }

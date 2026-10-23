@@ -60,9 +60,6 @@ func TestMarshalParseRoundTrip(t *testing.T) {
 	if lv == nil || lv.Node != "kv01" || lv.Epoch != 7 || lv.Port != 6666 {
 		t.Fatalf("bad round trip: %+v", lv)
 	}
-	if !elect.IsSelfLeader(v, "kv01") || elect.IsSelfLeader(v, "kv02") {
-		t.Fatal("IsSelfLeader wrong")
-	}
 }
 
 func TestBackoffBounds(t *testing.T) {
@@ -72,5 +69,36 @@ func TestBackoffBounds(t *testing.T) {
 		if d < 0 || d > 15*time.Second {
 			t.Fatalf("attempt %d out of bounds: %v", a, d)
 		}
+	}
+}
+
+func TestClassify(t *testing.T) {
+	cases := []struct {
+		holder, mine string
+		want         elect.LockState
+	}{
+		{"", "s1", elect.LockVacant},
+		{"", "", elect.LockVacant},
+		{"s1", "s1", elect.LockMine},
+		{"s2", "s1", elect.LockOther},
+		{"s2", "", elect.LockOther},
+	}
+	for _, tc := range cases {
+		if got := elect.Classify(tc.holder, tc.mine); got != tc.want {
+			t.Errorf("Classify(%q,%q)=%v want %v", tc.holder, tc.mine, got, tc.want)
+		}
+	}
+}
+
+func TestConsulOutageExceeded(t *testing.T) {
+	now := time.Now()
+	if elect.ConsulOutageExceeded(now.Add(-3*time.Second), now, 10*time.Second) {
+		t.Fatal("3s into a 10s TTL must be tolerated")
+	}
+	if !elect.ConsulOutageExceeded(now.Add(-10*time.Second), now, 10*time.Second) {
+		t.Fatal("a full TTL without renew must step down")
+	}
+	if !elect.ConsulOutageExceeded(time.Time{}, now, 10*time.Second) {
+		t.Fatal("never renewed must step down")
 	}
 }

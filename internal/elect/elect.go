@@ -96,8 +96,32 @@ func Backoff(attempt int, base, max time.Duration, rng *rand.Rand) time.Duration
 	return time.Duration(rng.Int63n(int64(d) + 1))
 }
 
-// IsSelfLeader reports whether raw lock value names node.
-func IsSelfLeader(raw []byte, node string) bool {
-	lv := ParseLeader(raw)
-	return lv != nil && lv.Node == node
+// LockState classifies who holds the leader key.
+type LockState int
+
+const (
+	LockVacant LockState = iota // no session holds the key
+	LockMine                    // our session holds it
+	LockOther                   // some other session holds it
+)
+
+// Classify decides leadership purely from the session holding the key.
+// The value's node name is informational only: it outlives releases and
+// does not distinguish two incarnations of the sidecar on one node.
+func Classify(holder, mySession string) LockState {
+	switch {
+	case holder == "":
+		return LockVacant
+	case mySession != "" && holder == mySession:
+		return LockMine
+	default:
+		return LockOther
+	}
+}
+
+// ConsulOutageExceeded reports whether a leader that last renewed its
+// session at lastRenew must step down because Consul may already have
+// expired the session (TTL elapsed without a successful renew).
+func ConsulOutageExceeded(lastRenew, now time.Time, ttl time.Duration) bool {
+	return lastRenew.IsZero() || now.Sub(lastRenew) >= ttl
 }

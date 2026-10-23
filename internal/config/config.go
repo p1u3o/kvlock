@@ -42,6 +42,12 @@ type Config struct {
 
 	Mode string // "active" or "observe"
 
+	// FenceHost/FencePort is the REPLICAOF target used to fence this
+	// instance when it must stop accepting writes but the new leader is
+	// unknown. It should be an address where nothing listens.
+	FenceHost string
+	FencePort int
+
 	MinLeaderTime      time.Duration
 	ReelectBaseBackoff time.Duration
 	ReelectMaxBackoff  time.Duration
@@ -131,6 +137,8 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.ReplicaTag, "replica-tag", getenv("REPLICA_TAG", "replica"), "Tag for the replica registration ($REPLICA_TAG)")
 
 	fs.StringVar(&c.Mode, "mode", getenv("MODE", "active"), "Mode: active|observe ($MODE)")
+	fs.StringVar(&c.FenceHost, "fence-host", getenv("FENCE_HOST", "127.0.0.1"), "REPLICAOF target used to fence a demoted master when the leader is unknown ($FENCE_HOST)")
+	fs.IntVar(&c.FencePort, "fence-port", getenvInt("FENCE_PORT", 1), "Port for --fence-host; must have nothing listening ($FENCE_PORT)")
 	fs.DurationVar(&c.MinLeaderTime, "min-leader-time", getenvDur("MIN_LEADER_TIME", 30*time.Second), "Minimum time to stay leader before voluntary step-down ($MIN_LEADER_TIME)")
 	fs.DurationVar(&c.ReelectBaseBackoff, "reelect-base-backoff", getenvDur("REELECT_BASE_BACKOFF", 1*time.Second), "Base backoff between elections ($REELECT_BASE_BACKOFF)")
 	fs.DurationVar(&c.ReelectMaxBackoff, "reelect-max-backoff", getenvDur("REELECT_MAX_BACKOFF", 15*time.Second), "Max backoff between elections ($REELECT_MAX_BACKOFF)")
@@ -169,6 +177,12 @@ func Parse(args []string) (*Config, error) {
 	}
 	if c.KVKind != "kvrocks" && c.KVKind != "redis" {
 		return nil, fmt.Errorf("invalid --kv-kind %q: want kvrocks|redis", c.KVKind)
+	}
+	if c.FencePort <= 0 || c.FencePort > 65535 {
+		return nil, fmt.Errorf("invalid --fence-port %d", c.FencePort)
+	}
+	if c.FencePort == c.KvrocksPort && (c.FenceHost == c.KvrocksAddr || c.FenceHost == "127.0.0.1" || c.FenceHost == "localhost") {
+		return nil, fmt.Errorf("--fence-host/--fence-port must not point at the local instance")
 	}
 	if c.SessionTTL < 5*time.Second {
 		return nil, fmt.Errorf("session TTL %v too short: minimum 5s", c.SessionTTL)
