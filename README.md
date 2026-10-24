@@ -288,7 +288,9 @@ or `POST /handover` with an optional JSON body
 `--admin-token`/`--admin-token-file` (`$KVLOCK_ADMIN_TOKEN[_FILE]`) the
 endpoint only accepts loopback clients; with a token it requires
 `Authorization: Bearer <token>` from anywhere. The CLI reads the same env
-vars, `--token`/`--token-file`, and `$KVLOCK_ADMIN_URL`.
+vars (`$KVLOCK_ADMIN_TOKEN`, or `--token-file`/`$KVLOCK_ADMIN_TOKEN_FILE`) and
+`$KVLOCK_ADMIN_URL`. Since v0.2.2 the CLI refuses `--token`: a token on the
+command line lands in shell history and `ps` output.
 
 Steps on the leader:
 
@@ -331,6 +333,101 @@ fails, it falls back to fence-then-release. The local kvrocks must still be
 running when the sidecar gets the signal (in Nomad, run kvrocks as the
 prestart sidecar task and kvrocks-leader as the main task so it is stopped
 first), and the sidecar's kill timeout must exceed the handover timeout.
+
+## Watchdog (fence on stale sidecar)
+
+If the sidecar process dies or hangs while its kvrocks is master, nothing
+fences that master until Consul expires the session, and a replica may be
+promoted meanwhile. `kvrocks-leader watchdog` closes that gap:
+
+- The sidecar (with `--watchdog-file PATH`, `$KVLOCK_WATCHDOG_FILE`) writes a
+  small JSON heartbeat file every `--watchdog-interval` (1s) from its own
+  goroutine, atomically (temp file + rename). It also records when the
+  control loop last finished a tick (`loop_unix_ms`, informational).
+- The watchdog, a separate process next to kvrocks, reads the file every
+  `--interval` (1s). When it is older than `--timeout` (5s, keep it **below
+  `--session-ttl`**, default 10s) **and** local kvrocks is a writable master,
+  it fences: `CONFIG SET replica-read-only yes`, `REPLICAOF --fence-host
+  --fence-port` (default 127.0.0.1:1, unroutable), optionally `CLIENT KILL
+  TYPE normal SKIPME yes` (`--kill-clients`), then confirms `role:slave`
+  and that a probe write (`kvlock:watchdog:probe`, PX 2000) is refused.
+  The read-only step matters: a promoted node runs with
+  `slave-read-only=no`, and REPLICAOF alone leaves it writable as a
+  disconnected replica (found by the loadtest, see below).
+- It re-reads the heartbeat right before fencing, so a sidecar that just
+  restarted is not raced. A missing file within `--startup-grace` (60s) is
+  "starting". Stale + replica, or stale + kvrocks down, is left alone.
+- It never promotes, never touches Consul and never undoes a fence; the
+  restarted sidecar recovers the node through its normal follower path.
+- **Observe mode**: if the watchdog runs with `--mode observe` or the
+  heartbeat says `"mode":"observe"`, it only logs and counts
+  `kvlock_watchdog_observe_would_fence_total`; it never fences, kills
+  connections or changes config.
+
+```sh
+kvrocks-leader watchdog --heartbeat-file /alloc/kvlock/heartbeat \
+  --kvrocks-port 6666 --timeout 5s --kill-clients --http-addr 127.0.0.1:9101
+```
+
+Metrics on `--http-addr` (`/metrics`, `/healthz`), own registry:
+`kvlock_watchdog_heartbeat_age_seconds`, `kvlock_watchdog_heartbeat_stale`,
+`kvlock_watchdog_checks_total{outcome}` (healthy, starting, stale_replica,
+stale_backend_down, observe_would_fence, raced, fenced, fence_failed),
+`kvlock_watchdog_fences_total{result}`, `kvlock_watchdog_observe_would_fence_total`,
+`kvlock_watchdog_clients_killed_total`, `kvlock_watchdog_last_fence_timestamp_seconds`.
+The sidecar adds `kvlock_watchdog_heartbeat_writes_total{result}`.
+Alert on `fences_total{result="error"}` and on any `fences_total{result="ok"}`.
+A Nomad task snippet is in [`docs/watchdog.nomad.hcl`](docs/watchdog.nomad.hcl).
+
+## Cluster status CLI
+
+```sh
+kvrocks-leader status --addr 10.0.0.11:8080 --addr 10.0.0.12:8080
+kvrocks-leader status --consul --service kvrocks --http-port 8080 --json
+```
+
+Reads `/status` from every node (`--addr` repeatable or comma-separated,
+`$KVLOCK_STATUS_ADDRS`, or every catalog instance of `--service` via
+`$CONSUL_HTTP_ADDR`), prints NODE / ROLE / EPOCH / HEALTH / LAG / LAST
+BACKUP / SESSION, or the full report with `--json`. Exit codes: `0`
+healthy; `1` when a node is unreachable or unhealthy, there is no leader,
+more than one leader or writable master (split brain), nodes disagree on
+the leader, a fence is pending, or a replica is over the lag limit (each
+node's `--max-lag-time`, or `--max-lag`); `2` usage/discovery error.
+Unknown lag is a warning only.
+
+## Load test (`kvrocks-leader loadtest`)
+
+Drives sequence-numbered mixed load and measures what a handover or
+failover costs. **Test clusters only**: it refuses port 6379 outright and
+refuses any `--addr` not listed in `--allow` (`host:port` or `:port`).
+
+```sh
+export KVLOCK_ADMIN_TOKEN=...   # or --token-file; never --token
+kvrocks-leader loadtest \
+  --addr 10.0.0.11:8379 --addr 10.0.0.12:8379 --allow :8379 \
+  --duration 120s --rate 2000 --workers 8 --keys 10000 \
+  --value-min 64 --value-max 1024 --pipeline 4 --read-ratio 0.7 \
+  --status-addr 10.0.0.11:8080 --status-addr 10.0.0.12:8080 \
+  --handover-at 30s
+```
+
+- Every key belongs to one worker, so writes per key are ordered; values
+  carry a global sequence number. Keys are `kvlock:loadtest:<run-id>:N`
+  and are deleted afterwards (`--keep-keys` to keep them).
+- With several `--addr` the writable master is discovered via `INFO
+  replication` and re-discovered after errors; with one address (proxy or
+  DNS) it is used as-is.
+- `--handover-at` calls `POST /handover` on the leader (found via
+  `--status-addr`, or `--admin-url`). For a hard failover, kill the leader's
+  sidecar or kvrocks yourself and `kill -USR1 <loadtest pid>` to drop a
+  marker into the timeline. `--status-addr` adds a leader/epoch timeline.
+- Report: writes/reads ok and failed with error kinds, the longest gap
+  between acknowledged writes and total unavailability (gaps above a
+  threshold), latency p50/p99/max per pipeline, **lost writes** (a key
+  holds an older sequence than one acknowledged) and **stale reads** (a
+  read returned an older sequence than one acknowledged before the read).
+  `--json` for machine output. Exit `1` on any lost or stale data.
 
 ## Leader proxy
 
@@ -509,5 +606,8 @@ and each start/success/failure/deletion is listed under Recent events.
 - `internal/httpapi` — /healthz /status /metrics /handover
 - `internal/proxy` — fail-closed TCP leader/read proxy
 - `internal/sentinel` + `internal/resp` — Sentinel-compatible endpoint
+- `internal/watchdog` — heartbeat file + stale-sidecar fence
+- `internal/clusterstatus` — `status` CLI evaluation
+- `internal/loadtest` — `loadtest` engine; `internal/testkv` starts a real kvrocks in tests
 - `internal/metrics`, `internal/logx`
 - `deploy/` — `consul-policy.hcl`, `kvrocks.nomad.hcl`, compose, `integration.sh`
