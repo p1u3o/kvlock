@@ -28,6 +28,15 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "handover" {
 		os.Exit(runHandover(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "watchdog" {
+		os.Exit(runWatchdog(os.Args[2:], os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "status" {
+		os.Exit(runStatus(os.Args[2:], os.Stdout, os.Stderr))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "loadtest" {
+		os.Exit(runLoadtest(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "restore" {
 		os.Exit(runRestore(os.Args[2:], os.Stdout, os.Stderr))
 	}
