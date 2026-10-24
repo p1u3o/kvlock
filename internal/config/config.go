@@ -78,6 +78,11 @@ type Config struct {
 
 	HTTPAddr string
 
+	// WatchdogFile, when set, is the heartbeat file the sidecar refreshes
+	// every WatchdogInterval for `kvrocks-leader watchdog`.
+	WatchdogFile     string
+	WatchdogInterval time.Duration
+
 	// AdminToken guards admin endpoints (POST /handover). When empty they
 	// only accept connections from loopback addresses.
 	AdminToken     string
@@ -238,6 +243,8 @@ func Parse(args []string) (*Config, error) {
 
 	fs.BoolVar(&c.KillClientsOnDemote, "kill-clients-on-demote", getenvBool("KILL_CLIENTS_ON_DEMOTE", true), "After fencing a demoted master, CLIENT KILL TYPE normal so clients reconnect ($KILL_CLIENTS_ON_DEMOTE)")
 
+	fs.StringVar(&c.WatchdogFile, "watchdog-file", getenv("KVLOCK_WATCHDOG_FILE", ""), "Heartbeat file for the watchdog, e.g. ${NOMAD_ALLOC_DIR}/kvlock/heartbeat; empty disables ($KVLOCK_WATCHDOG_FILE)")
+	fs.DurationVar(&c.WatchdogInterval, "watchdog-interval", getenvDur("KVLOCK_WATCHDOG_INTERVAL", time.Second), "How often the heartbeat file is refreshed ($KVLOCK_WATCHDOG_INTERVAL)")
 	fs.StringVar(&c.HTTPAddr, "http-addr", getenv("HTTP_ADDR", ":8080"), "Health/metrics listen address ($HTTP_ADDR)")
 	fs.StringVar(&c.AdminToken, "admin-token", getenv("KVLOCK_ADMIN_TOKEN", ""), "Bearer token for admin endpoints; empty = loopback clients only ($KVLOCK_ADMIN_TOKEN)")
 	fs.StringVar(&c.AdminTokenFile, "admin-token-file", getenv("KVLOCK_ADMIN_TOKEN_FILE", ""), "File containing the admin token ($KVLOCK_ADMIN_TOKEN_FILE)")
@@ -283,6 +290,9 @@ func Parse(args []string) (*Config, error) {
 		c.KvrocksPassword = string(bytesTrim(b))
 	}
 
+	if c.WatchdogFile != "" && c.WatchdogInterval <= 0 {
+		return nil, fmt.Errorf("--watchdog-interval must be > 0")
+	}
 	if c.AdvertiseAddr == "" {
 		c.AdvertiseAddr = c.KvrocksAddr
 	}

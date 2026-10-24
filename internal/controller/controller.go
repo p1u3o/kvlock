@@ -36,6 +36,7 @@ type Deps struct {
 
 // Controller owns runtime state.
 type Controller struct {
+	loopAt  atomic.Int64 // unix ms of the last completed tick (watchdog file)
 	obsMu   sync.Mutex
 	obsSeen map[string]time.Time // observe decisions already logged
 	cfg     *config.Config
@@ -257,6 +258,12 @@ func (c *Controller) Run(ctx context.Context) {
 	// and testability; watch loop runs separately for followers.
 	go c.watchLoop(ctx)
 	go c.backendReturnWatch(ctx)
+	if c.cfg.WatchdogFile != "" {
+		// Written in observe mode too (mode "observe" tells the watchdog
+		// to stay passive); it is a local file, not a cluster side effect.
+		c.writeWatchdogHeartbeat()
+		go c.watchdogLoop(ctx)
+	}
 	if c.cfg.Mode != "observe" {
 		go c.heartbeatLoop(ctx)
 		c.startBackups(ctx)
@@ -280,6 +287,7 @@ func (c *Controller) Run(ctx context.Context) {
 			c.renewSession(ctx)
 		case <-ticker.C:
 			c.tick(ctx)
+			c.loopAt.Store(time.Now().UnixMilli())
 		}
 	}
 }

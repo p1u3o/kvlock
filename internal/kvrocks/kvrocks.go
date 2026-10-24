@@ -473,3 +473,31 @@ func parseSlaveLine(v string) (ReplicaState, bool) {
 	}
 	return rs, ok
 }
+
+// WriteProbeKey is the key WriteProbe writes (with a short expiry).
+const WriteProbeKey = "kvlock:watchdog:probe"
+
+// WriteProbe tries SET WriteProbeKey with a 2s expiry and reports whether
+// the instance accepted it. A READONLY rejection is (false, nil); any other
+// error is returned. Used to confirm a fence actually stops writes.
+func (c *RedisClient) WriteProbe(ctx context.Context) (bool, error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	err := c.rdb.Do(ctx, "SET", WriteProbeKey, strconv.FormatInt(time.Now().UnixMilli(), 10), "PX", "2000").Err()
+	if err == nil {
+		return true, nil
+	}
+	if IsReadOnlyError(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// IsReadOnlyError reports whether err is a replica's write rejection.
+func IsReadOnlyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.HasPrefix(m, "readonly") || strings.Contains(m, "read only") || strings.Contains(m, "read-only")
+}

@@ -63,6 +63,9 @@ type Registry struct {
 	BackupDuration    prometheus.Gauge
 	BackupFailures    prometheus.Counter
 
+	// WatchdogWrites counts heartbeat-file writes for the watchdog.
+	WatchdogWrites *prometheus.CounterVec // result=ok|error
+
 	connMu sync.Mutex
 	conns  map[string]float64
 
@@ -98,6 +101,8 @@ func New() *Registry {
 	r.BackupDuration = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "backup_duration_seconds", Help: "Duration of this node's last successful backup (BGSAVE + upload)."})
 	r.BackupFailures = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "backup_failures_total", Help: "Failed backup attempts on this node."})
 
+	r.WatchdogWrites = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "watchdog_heartbeat_writes_total", Help: "Writes of the watchdog heartbeat file, by result."}, []string{"result"})
+
 	renew := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: Namespace, Name: "consul_last_renew_age_seconds", Help: "Seconds since Consul last confirmed our session; +Inf before the first success."},
 		func() float64 { return call(&r.renewAge, math.Inf(1)) })
 	held := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: Namespace, Name: "lock_held_seconds", Help: "Seconds this node has held the leader lock; 0 when not leader."},
@@ -106,7 +111,7 @@ func New() *Registry {
 	r.prom.MustRegister(r.IsLeader, r.BackendUp, r.ReplicationLag, r.Elections, r.LeaderAcquired, r.LeaderChanges,
 		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, r.ProxyActive, r.ProxyDropped, r.ProxyRefused, renew, held,
 		r.LagSeconds, r.HeartbeatAge, r.Heartbeats, r.LagRefusals,
-		r.BackupLastSuccess, r.BackupLastSize, r.BackupDuration, r.BackupFailures,
+		r.BackupLastSuccess, r.BackupLastSize, r.BackupDuration, r.BackupFailures, r.WatchdogWrites,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	r.ReplicationLag.Set(-1)
@@ -114,6 +119,8 @@ func New() *Registry {
 	r.HeartbeatAge.Set(-1)
 	r.Heartbeats.WithLabelValues("ok")
 	r.Heartbeats.WithLabelValues("error")
+	r.WatchdogWrites.WithLabelValues("ok")
+	r.WatchdogWrites.WithLabelValues("error")
 	for _, reason := range []string{ReasonBackendUnhealthy, ReasonSessionInvalidated, ReasonConsulUnreachable, ReasonLockLost, ReasonLockTaken, ReasonHandover, ReasonShutdown} {
 		r.StepDowns.WithLabelValues(reason)
 	}
