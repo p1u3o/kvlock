@@ -16,22 +16,22 @@ type proxyViewer interface {
 }
 
 func writeRoute(v proxyViewer) proxy.Route {
-	return func() (string, string, string) {
+	return func() proxy.Decision {
 		pv := v.ProxyView()
-		return pv.Leader, pv.Key, pv.Reason
+		return proxy.Decision{Addr: pv.Leader, Key: pv.Key, Reason: pv.Reason, Refuse: pv.State == controller.RouteRefuse}
 	}
 }
 
 func readRoute(v proxyViewer, fallbackLeader bool) proxy.Route {
-	return func() (string, string, string) {
+	return func() proxy.Decision {
 		pv := v.ProxyView()
 		if pv.Replica != "" {
-			return pv.Replica, "replica|" + pv.Replica, "local replica healthy"
+			return proxy.Decision{Addr: pv.Replica, Key: "replica|" + pv.Replica, Reason: "local replica healthy"}
 		}
 		if fallbackLeader {
-			return pv.Leader, pv.Key, "local replica unusable; " + nonEmpty(pv.Reason, "using leader")
+			return proxy.Decision{Addr: pv.Leader, Key: pv.Key, Reason: "local replica unusable; " + nonEmpty(pv.Reason, "using leader"), Refuse: pv.State == controller.RouteRefuse}
 		}
-		return "", "", "local replica unusable"
+		return proxy.Decision{Reason: "local replica unusable"}
 	}
 }
 
@@ -44,11 +44,18 @@ func nonEmpty(s, def string) string {
 
 // forwardViewer is the controller surface the replication forwarder uses.
 type forwardViewer interface {
-	ForwardView() (addr, key, reason string)
+	ForwardView() controller.ForwardRoute
 	Subscribe() <-chan struct{}
 }
 
-func forwardRoute(v forwardViewer) proxy.Route { return v.ForwardView }
+// forwardRoute maps the controller's typed decision onto the proxy: only
+// a transient state lets the forwarder hold a client.
+func forwardRoute(v forwardViewer) proxy.Route {
+	return func() proxy.Decision {
+		r := v.ForwardView()
+		return proxy.Decision{Addr: r.Addr, Key: r.Key, Reason: r.Reason, Refuse: r.Addr == "" && r.State != controller.RouteTransient}
+	}
+}
 
 func startProxy(name, addr string, route proxy.Route, v proxyViewer, reg *metrics.Registry, log *logx.Logger) (*proxy.Proxy, error) {
 	return startProxyHold(name, addr, route, v.Subscribe(), 0, reg, log)

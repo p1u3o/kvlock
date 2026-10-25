@@ -42,7 +42,7 @@ func TestForwardFollowerReplicatesViaForwarderOnce(t *testing.T) {
 		_, h, p := kv.state()
 		return h == "127.0.1.1" && p == 18379
 	})
-	addr, key1, _ := c.ForwardView()
+	addr, key1, _ := fwd(c)
 	if addr != "10.0.0.1:23001" {
 		t.Fatalf("forward target: %q", addr)
 	}
@@ -56,8 +56,8 @@ func TestForwardFollowerReplicatesViaForwarderOnce(t *testing.T) {
 	lock.sess = "sess-y"
 	lock.idx++
 	lock.mu.Unlock()
-	waitFor(t, 2*time.Second, func() bool { a, _, _ := c.ForwardView(); return a == "10.0.0.3:27777" })
-	_, key2, _ := c.ForwardView()
+	waitFor(t, 2*time.Second, func() bool { a, _, _ := fwd(c); return a == "10.0.0.3:27777" })
+	_, key2, _ := fwd(c)
 	if key1 == key2 {
 		t.Fatal("key must change with the leader")
 	}
@@ -81,13 +81,13 @@ func TestForwardKeyIncludesEpoch(t *testing.T) {
 	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 23001, "sess-x", 3, time.Now()), sess: "sess-x"}
 	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
 	defer stop()
-	waitFor(t, 2*time.Second, func() bool { a, _, _ := c.ForwardView(); return a != "" })
-	_, k1, _ := c.ForwardView()
+	waitFor(t, 2*time.Second, func() bool { a, _, _ := fwd(c); return a != "" })
+	_, k1, _ := fwd(c)
 	lock.mu.Lock()
 	lock.val = elect.MarshalLeader("kv01", "10.0.0.1", "", 23001, "sess-x", 4, time.Now())
 	lock.idx++
 	lock.mu.Unlock()
-	waitFor(t, 2*time.Second, func() bool { _, k, _ := c.ForwardView(); return k != "" && k != k1 })
+	waitFor(t, 2*time.Second, func() bool { _, k, _ := fwd(c); return k != "" && k != k1 })
 }
 
 // The leader's forwarder refuses: forwarding to itself would loop.
@@ -97,7 +97,7 @@ func TestForwardLeaderRefuses(t *testing.T) {
 	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: &fakeLock{}, Registrar: &fakeRegistrar{}, KV: kv})
 	defer stop()
 	waitFor(t, 2*time.Second, func() bool { return c.Snapshot().Role == elect.RoleLeader })
-	addr, key, reason := c.ForwardView()
+	addr, key, reason := fwd(c)
 	if addr != "" || key != "" || !strings.Contains(reason, "leader") {
 		t.Fatalf("leader must not forward: %q %q %q", addr, key, reason)
 	}
@@ -113,12 +113,12 @@ func TestForwardRefusesWhenLeaderUnknown(t *testing.T) {
 	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 23001, "sess-x", 3, time.Now()), sess: "sess-x", refuse: true}
 	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
 	defer stop()
-	waitFor(t, 2*time.Second, func() bool { a, _, _ := c.ForwardView(); return a != "" })
+	waitFor(t, 2*time.Second, func() bool { a, _, _ := fwd(c); return a != "" })
 	lock.mu.Lock()
 	lock.sess = ""
 	lock.idx++
 	lock.mu.Unlock()
-	waitFor(t, 2*time.Second, func() bool { a, _, _ := c.ForwardView(); return a == "" })
+	waitFor(t, 2*time.Second, func() bool { a, _, _ := fwd(c); return a == "" })
 }
 
 // Disabled by default: REPLICAOF goes to the leader directly.
@@ -129,4 +129,9 @@ func TestForwardDisabledUsesLeaderAddr(t *testing.T) {
 	_, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
 	defer stop()
 	waitFor(t, 2*time.Second, func() bool { _, h, p := kv.state(); return h == "10.0.0.1" && p == 23001 })
+}
+
+func fwd(c *controller.Controller) (addr, key, reason string) {
+	r := c.ForwardView()
+	return r.Addr, r.Key, r.Reason
 }

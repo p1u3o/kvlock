@@ -85,6 +85,15 @@ type Controller struct {
 	peerSampled bool
 	peerAt      time.Time // when peerOffset was taken
 	peerSession string
+	// Last time this node read the remote leader's kvrocks as master, and
+	// for which leader session and epoch (leaderVerifyLoop).
+	verifiedSession string
+	verifiedEpoch   uint64
+	verifiedAt      time.Time
+	// lastLockRead is the last successful read of the leader key; routing
+	// confirmation is based on it (a session renew alone does not show
+	// who holds the lock).
+	lastLockRead time.Time
 
 	hb     hbState
 	probed bool // the first tick has probed the local instance
@@ -294,6 +303,7 @@ func (c *Controller) Run(ctx context.Context) {
 	// and testability; watch loop runs separately for followers.
 	go c.watchLoop(ctx)
 	go c.backendReturnWatch(ctx)
+	go c.leaderVerifyLoop(ctx)
 	if c.cfg.WatchdogFile != "" {
 		// Written in observe mode too (mode "observe" tells the watchdog
 		// to stay passive); it is a local file, not a cluster side effect.
@@ -489,6 +499,7 @@ func (c *Controller) tick(ctx context.Context) {
 	}
 	c.mu.Lock()
 	c.lastConsulOK = time.Now()
+	c.lastLockRead = c.lastConsulOK
 	c.mu.Unlock()
 	c.evaluate(ctx, ri, raw, holder, sid)
 	c.mu.RLock()

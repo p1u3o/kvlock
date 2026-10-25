@@ -53,7 +53,10 @@ func (pl *peerListeners) sync(ctx context.Context) {
 		}
 		idx := i
 		ch := make(chan struct{}, 1)
-		p, err := startProxyHold(fmt.Sprintf("peer-%d", idx), addr, func() (string, string, string) { return pl.src.PeerRoute(idx) }, ch, 0, pl.reg, pl.log)
+		p, err := startProxyHold(fmt.Sprintf("peer-%d", idx), addr, func() proxy.Decision {
+			a, k, r := pl.src.PeerRoute(idx)
+			return proxy.Decision{Addr: a, Key: k, Reason: r}
+		}, ch, 0, pl.reg, pl.log)
 		if err != nil {
 			pl.log.Warn("peer listener failed", map[string]any{"addr": addr, "error": err.Error()})
 			continue

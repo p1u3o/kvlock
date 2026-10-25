@@ -13,17 +13,17 @@ func (f fixedView) Subscribe() <-chan struct{}      { return nil }
 
 func TestReadRoute(t *testing.T) {
 	both := fixedView{controller.ProxyView{Leader: "10.0.0.1:6666", Key: "k", Replica: "127.0.0.1:6666"}}
-	if a, _, _ := readRoute(both, true)(); a != "127.0.0.1:6666" {
+	if a := readRoute(both, true)().Addr; a != "127.0.0.1:6666" {
 		t.Fatalf("healthy replica should be preferred, got %s", a)
 	}
 	noRep := fixedView{controller.ProxyView{Leader: "10.0.0.1:6666", Key: "k"}}
-	if a, k, _ := readRoute(noRep, true)(); a != "10.0.0.1:6666" || k != "k" {
-		t.Fatalf("fallback to leader: %s %s", a, k)
+	if d := readRoute(noRep, true)(); d.Addr != "10.0.0.1:6666" || d.Key != "k" {
+		t.Fatalf("fallback to leader: %s %s", d.Addr, d.Key)
 	}
-	if a, _, _ := readRoute(noRep, false)(); a != "" {
+	if a := readRoute(noRep, false)().Addr; a != "" {
 		t.Fatalf("refuse mode must not route, got %s", a)
 	}
-	if a, _, _ := writeRoute(both)(); a != "10.0.0.1:6666" {
+	if a := writeRoute(both)().Addr; a != "10.0.0.1:6666" {
 		t.Fatalf("write route: %s", a)
 	}
 }

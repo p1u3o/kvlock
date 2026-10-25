@@ -14,9 +14,19 @@ import (
 	"time"
 )
 
-// Route returns the address to dial and a key for the routing decision.
-// addr == "" means refuse. Connections are closed when key changes.
-type Route func() (addr, key, reason string)
+// Decision is one routing decision. Addr == "" means no target: Refuse
+// says whether that is definitive (refuse new clients at once, even with a
+// Hold) or transient (a held client may wait for a target to appear).
+// Connections are closed when Key changes.
+type Decision struct {
+	Addr   string
+	Key    string
+	Reason string
+	Refuse bool
+}
+
+// Route returns the current routing decision.
+type Route func() Decision
 
 // Counters is the metrics surface (all optional).
 type Counters struct {
@@ -208,11 +218,14 @@ func (p *Proxy) watch() {
 }
 
 // sync re-evaluates the route and drops connections if it changed.
-func (p *Proxy) sync() (addr, key, reason string) {
-	addr, key, reason = p.Route()
-	if addr == "" {
-		key = ""
+func (p *Proxy) sync() (d Decision) {
+	d = p.Route()
+	if d.Addr == "" {
+		d.Key = ""
+	} else {
+		d.Refuse = false
 	}
+	addr, key, reason := d.Addr, d.Key, d.Reason
 	p.mu.Lock()
 	p.target, p.reason = addr, reason
 	if key == p.key {
@@ -246,23 +259,25 @@ func (p *Proxy) refuse(c net.Conn, why string) {
 }
 
 func (p *Proxy) handle(c net.Conn) {
-	addr, key, reason := p.sync()
-	if addr == "" && p.Hold > 0 {
+	d := p.sync()
+	if d.Addr == "" && !d.Refuse && p.Hold > 0 {
 		// Hold the client briefly: a failover usually resolves in well
-		// under Hold. Poll instead of subscribing; the cost is tiny.
+		// under Hold. Poll instead of subscribing; the cost is tiny. A
+		// definitive refusal (e.g. this node is the leader) ends the hold.
 		deadline := time.Now().Add(p.Hold)
-		for addr == "" && time.Now().Before(deadline) {
+		for d.Addr == "" && !d.Refuse && time.Now().Before(deadline) {
 			select {
 			case <-p.done:
 				c.Close()
 				return
 			case <-time.After(25 * time.Millisecond):
 			}
-			addr, key, reason = p.sync()
+			d = p.sync()
 		}
 	}
+	addr, key := d.Addr, d.Key
 	if addr == "" {
-		p.refuse(c, reason)
+		p.refuse(c, d.Reason)
 		return
 	}
 	up, err := net.DialTimeout("tcp", addr, p.DialTimeout)

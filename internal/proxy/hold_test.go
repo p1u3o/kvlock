@@ -71,3 +71,17 @@ func TestStatsAcrossSwitch(t *testing.T) {
 	waitClosed(t, c)
 	eventually(t, func() bool { s := p.Stats(); return s.Resets == 1 && s.Active == 0 && s.Dropped == 1 && s.Target == b })
 }
+
+// A definitive refusal closes the client immediately instead of holding.
+func TestRefuseSkipsHold(t *testing.T) {
+	r := &router{refuse: true}
+	p, addr := startHold(t, r, nil, 3*time.Second)
+	c, _ := net.Dial("tcp", addr)
+	defer c.Close()
+	start := time.Now()
+	waitClosed(t, c)
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("refused connection was held for %v", d)
+	}
+	eventually(t, func() bool { return p.Stats().Refused == 1 })
+}

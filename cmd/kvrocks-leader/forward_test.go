@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/p1u3o/kvlock/internal/controller"
 	"github.com/p1u3o/kvlock/internal/logx"
 	"github.com/p1u3o/kvlock/internal/metrics"
 )
@@ -49,6 +50,7 @@ type leaderView struct {
 	mu                 sync.Mutex
 	addr, sess, reason string
 	epoch              int
+	self               bool
 }
 
 func (v *leaderView) set(addr, sess string, epoch int) {
@@ -56,13 +58,16 @@ func (v *leaderView) set(addr, sess string, epoch int) {
 	v.addr, v.sess, v.epoch = addr, sess, epoch
 	v.mu.Unlock()
 }
-func (v *leaderView) ForwardView() (string, string, string) {
+func (v *leaderView) ForwardView() controller.ForwardRoute {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.addr == "" {
-		return "", "", "no confirmed leader"
+	if v.self {
+		return controller.ForwardRoute{Reason: "this node is the leader", State: controller.RouteRefuse}
 	}
-	return v.addr, fmt.Sprintf("%s|%s|%d", v.addr, v.sess, v.epoch), ""
+	if v.addr == "" {
+		return controller.ForwardRoute{Reason: "no confirmed leader", State: controller.RouteTransient}
+	}
+	return controller.ForwardRoute{Addr: v.addr, Key: fmt.Sprintf("%s|%s|%d", v.addr, v.sess, v.epoch), State: controller.RouteOK}
 }
 
 func ask(t *testing.T, c net.Conn, r *bufio.Reader) string {

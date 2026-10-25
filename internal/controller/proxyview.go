@@ -1,25 +1,63 @@
 package controller
 
 import (
+	"context"
 	"net"
 	"strconv"
 	"time"
 
+	"github.com/p1u3o/kvlock/internal/consulstore"
 	"github.com/p1u3o/kvlock/internal/elect"
 )
+
+// RouteState classifies a routing decision.
+type RouteState int
+
+const (
+	// RouteOK: the decision has a target address.
+	RouteOK RouteState = iota
+	// RouteTransient: no target right now, but one is expected soon
+	// (leader unknown, election or Consul confirmation in progress). A
+	// proxy with a hold may keep new clients waiting.
+	RouteTransient
+	// RouteRefuse: waiting will not produce a target on this listener
+	// (this node is the leader, the leader has no address). Refuse at once.
+	RouteRefuse
+)
+
+func (s RouteState) String() string {
+	switch s {
+	case RouteOK:
+		return "ok"
+	case RouteTransient:
+		return "transient"
+	case RouteRefuse:
+		return "refuse"
+	}
+	return "unknown"
+}
 
 // ProxyView is what the leader proxies route on.
 type ProxyView struct {
 	// Leader is the address to dial for writes, "" when no safe target is
-	// known (Reason says why).
+	// known (Reason and State say why).
 	Leader string
 	// Key identifies the routing decision; proxied connections are closed
 	// whenever it changes (new holder, role change, fencing).
 	Key    string
 	Reason string
+	State  RouteState
 	// Replica is the local instance's address when it is a healthy,
 	// caught-up replica of a known leader, else "".
 	Replica string
+}
+
+// ForwardRoute is the replication forwarder's routing decision.
+type ForwardRoute struct {
+	Addr   string
+	Key    string
+	Reason string
+	State  RouteState
 }
 
 // Subscribe returns a channel signalled (coalesced) on leadership or
@@ -43,30 +81,82 @@ func (c *Controller) notify() {
 	}
 }
 
+// confirmGrace is how recently Consul must have answered for a route to
+// count as confirmed on that alone.
+func (c *Controller) confirmGrace() time.Duration {
+	g := 2 * c.cfg.CheckInterval
+	if g < time.Second {
+		g = time.Second
+	}
+	return g
+}
+
+// routeConfirmedLocked decides whether the known leader lv may still be
+// routed to. Callers hold c.mu.
+//
+// Consul answered within confirmGrace: yes. A slow tick or a short Consul
+// hiccup is not a leadership change, so after that the last known leader
+// stays routable while all of these hold:
+//   - Consul answered within one session TTL. Consul cannot have let
+//     another session take the lock before the holder's TTL ran out
+//     (plus lock-delay), unless the holder released it, and a holder
+//     always fences itself before releasing.
+//   - for a remote leader: this node read the leader's own kvrocks within
+//     confirmGrace and it reported role master, for the same session and
+//     epoch. A fenced old leader stops reporting master at once, so the
+//     route never points at a node that is not the current master.
+//   - for this node as leader: our session was renewed within TTL/2, so
+//     nobody else can hold the lock.
+//
+// An epoch or session change seen in Consul replaces c.leader and so
+// changes the key, which cuts every connection as before.
+func (c *Controller) routeConfirmedLocked(lv *consulstore.LeaderValue, self bool) (bool, string) {
+	if lv == nil {
+		return false, "leader unknown"
+	}
+	if c.lastLockRead.IsZero() {
+		return false, "leadership state not confirmed with Consul"
+	}
+	since := time.Since(c.lastLockRead)
+	grace := c.confirmGrace()
+	if since < grace {
+		return true, ""
+	}
+	if since >= c.cfg.SessionTTL {
+		return false, "leadership state not confirmed with Consul"
+	}
+	if self {
+		if c.sessionValid && !c.lastRenewOK.IsZero() && time.Since(c.lastRenewOK) < c.cfg.SessionTTL/2 {
+			return true, ""
+		}
+		return false, "leadership state not confirmed with Consul (session renewal stale)"
+	}
+	if c.verifiedAt.IsZero() || time.Since(c.verifiedAt) >= grace || c.verifiedSession != lv.Session || c.verifiedEpoch != lv.Epoch {
+		return false, "leadership state not confirmed with Consul and leader not verified as master"
+	}
+	return true, ""
+}
+
 // ProxyView computes the current routing decision. It fails closed: no
-// leader target unless the lock holder is known and Consul answered
-// within two check intervals.
+// leader target unless the lock holder is known and confirmed (see
+// routeConfirmedLocked).
 func (c *Controller) ProxyView() ProxyView {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	local := net.JoinHostPort(c.cfg.KvrocksAddr, strconv.Itoa(c.cfg.KvrocksPort))
-	grace := 2 * c.cfg.CheckInterval
-	if grace < time.Second {
-		grace = time.Second
-	}
-	confirmed := !c.lastConsulOK.IsZero() && time.Since(c.lastConsulOK) < grace
 
 	var v ProxyView
 	lv := c.leader
 	if lv != nil && c.role != elect.RoleLeader && c.kvUp && c.backendRole == "slave" && c.lag >= 0 && c.lag <= c.cfg.MaxLagBytes {
 		v.Replica = local
 	}
+	self := lv != nil && lv.Session != "" && lv.Session == c.sessionID
+	ok, why := c.routeConfirmedLocked(lv, self)
+	v.State = RouteTransient
 	switch {
-	case lv == nil:
-		v.Reason = "leader unknown"
-	case !confirmed:
-		v.Reason = "leadership state not confirmed with Consul"
-	case lv.Session != "" && lv.Session == c.sessionID:
+	case !ok:
+		v.Reason = why
+	case self:
 		if c.role != elect.RoleLeader || !c.kvUp || c.backendRole != "master" {
 			v.Reason = "local leader not ready"
 			break
@@ -82,46 +172,90 @@ func (c *Controller) ProxyView() ProxyView {
 			host = lv.PrivateAddr
 		}
 		if host == "" || lv.Port == 0 {
-			v.Reason = "leader address unknown"
+			v.Reason, v.State = "leader address unknown", RouteRefuse
 			break
 		}
 		v.Leader = net.JoinHostPort(host, strconv.Itoa(lv.Port))
 	}
 	if v.Leader != "" {
+		v.State = RouteOK
 		v.Key = v.Leader + "|" + lv.Session + "|" + string(c.role) + "|" + strconv.FormatUint(c.fenceGen.Load(), 10)
 	}
 	return v
 }
 
 // ForwardView is the replication forwarder's routing decision: the real
-// address of the current lock holder, or "" (refuse/hold) when this node
-// is the leader, the leader is unknown, or Consul has not confirmed it
-// recently. The key includes session and epoch, so any leadership change
-// cuts every forwarded connection, even if the address is reused.
-func (c *Controller) ForwardView() (addr, key, reason string) {
+// address of the current lock holder, or no target. This node being the
+// leader is RouteRefuse (the leader never replicates, so holding a client
+// would only delay its error); an unknown or unconfirmed leader is
+// RouteTransient. The key includes session and epoch, so any leadership
+// change cuts every forwarded connection, even if the address is reused.
+func (c *Controller) ForwardView() ForwardRoute {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	grace := 2 * c.cfg.CheckInterval
-	if grace < time.Second {
-		grace = time.Second
-	}
 	lv := c.leader
-	switch {
-	case lv == nil:
-		return "", "", "leader unknown"
-	case c.lastConsulOK.IsZero() || time.Since(c.lastConsulOK) >= grace:
-		return "", "", "leadership state not confirmed with Consul"
-	case lv.Node == c.cfg.NodeName || (lv.Session != "" && lv.Session == c.sessionID) || c.role == elect.RoleLeader:
-		// The leader never replicates; forwarding to itself would loop.
-		return "", "", "this node is the leader"
+	if lv != nil && (lv.Node == c.cfg.NodeName || (lv.Session != "" && lv.Session == c.sessionID) || c.role == elect.RoleLeader) {
+		// Checked first: whatever Consul says, a node that is or thinks
+		// it is the leader must not forward to anyone, and its own
+		// kvrocks must not wait on it.
+		return ForwardRoute{Reason: "this node is the leader", State: RouteRefuse}
+	}
+	if lv == nil && c.role == elect.RoleLeader {
+		return ForwardRoute{Reason: "this node is the leader", State: RouteRefuse}
+	}
+	if ok, why := c.routeConfirmedLocked(lv, false); !ok {
+		return ForwardRoute{Reason: why, State: RouteTransient}
 	}
 	host := lv.Addr
 	if lv.PrivateAddr != "" {
 		host = lv.PrivateAddr
 	}
 	if host == "" || lv.Port == 0 {
-		return "", "", "leader address unknown"
+		return ForwardRoute{Reason: "leader address unknown", State: RouteRefuse}
 	}
-	addr = net.JoinHostPort(host, strconv.Itoa(lv.Port))
-	return addr, addr + "|" + lv.Session + "|" + strconv.FormatUint(lv.Epoch, 10), "forwarding to leader " + lv.Node
+	addr := net.JoinHostPort(host, strconv.Itoa(lv.Port))
+	return ForwardRoute{Addr: addr, Key: addr + "|" + lv.Session + "|" + strconv.FormatUint(lv.Epoch, 10), Reason: "forwarding to leader " + lv.Node, State: RouteOK}
+}
+
+// leaderVerifyLoop reads the remote leader's kvrocks role independently
+// of the tick, so a slow tick or a short Consul gap does not by itself
+// cut routes to a leader that is still master (see routeConfirmedLocked).
+func (c *Controller) leaderVerifyLoop(ctx context.Context) {
+	every := c.cfg.CheckInterval
+	if every < 100*time.Millisecond {
+		every = 100 * time.Millisecond
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		c.verifyLeaderOnce(ctx)
+	}
+}
+
+func (c *Controller) verifyLeaderOnce(ctx context.Context) {
+	c.mu.RLock()
+	lv := c.leader
+	self := c.role == elect.RoleLeader || (lv != nil && lv.Session != "" && lv.Session == c.sessionID)
+	c.mu.RUnlock()
+	target := c.followTarget(lv)
+	if self || target == nil {
+		return
+	}
+	pctx, cancel := context.WithTimeout(ctx, minDur(c.cfg.KvrocksTimeout, c.confirmGrace()/2))
+	defer cancel()
+	ph, pp := c.probeAddr(target)
+	pi, err := c.deps.KV.PeerInfoReplication(pctx, ph, pp)
+	if err != nil || pi == nil || pi.Role != "master" {
+		return
+	}
+	c.mu.Lock()
+	if c.leader != nil && c.leader.Session == lv.Session && c.leader.Epoch == lv.Epoch {
+		c.verifiedSession, c.verifiedEpoch, c.verifiedAt = lv.Session, lv.Epoch, time.Now()
+	}
+	c.mu.Unlock()
 }

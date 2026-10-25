@@ -43,13 +43,14 @@ func echo(t *testing.T, tag string) string {
 type router struct {
 	mu        sync.Mutex
 	addr, key string
+	refuse    bool
 }
 
 func (r *router) set(a, k string) { r.mu.Lock(); r.addr, r.key = a, k; r.mu.Unlock() }
-func (r *router) route() (string, string, string) {
+func (r *router) route() Decision {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.addr, r.key, "test"
+	return Decision{Addr: r.addr, Key: r.key, Reason: "test", Refuse: r.refuse}
 }
 
 func startProxy(t *testing.T, r *router, notify chan struct{}) (*Proxy, string, *int64, *int64, *int64) {
