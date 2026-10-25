@@ -186,6 +186,8 @@ type fakeKV struct {
 	rsidCalls int
 	rsidOK    int
 	setRO     int
+	// roAtReplicaOf records the read-only setting at each REPLICAOF host port.
+	roAtReplicaOf []bool
 
 	hbLocal   string // heartbeat value in the local instance
 	hbPeer    string // heartbeat value in the leader's instance
@@ -271,6 +273,9 @@ func (f *fakeKV) ReplicaOf(ctx context.Context, h string, p int) error {
 		return errString("replicaof failed")
 	}
 	f.follows++
+	if p != 0 {
+		f.roAtReplicaOf = append(f.roAtReplicaOf, f.readonly)
+	}
 	if p == 0 {
 		f.role = "master"
 	} else {

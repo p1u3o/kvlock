@@ -36,6 +36,7 @@ type Deps struct {
 
 // Controller owns runtime state.
 type Controller struct {
+	roOK    atomic.Bool  // replica-read-only=yes confirmed since the last promotion
 	loopAt  atomic.Int64 // unix ms of the last completed tick (watchdog file)
 	obsMu   sync.Mutex
 	obsSeen map[string]time.Time // observe decisions already logged
@@ -648,7 +649,23 @@ func (c *Controller) onFollow(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 	}
 	if ri != nil && !(ri.Role == "slave" && ri.MasterHost == target.Addr && ri.MasterPort == target.Port) {
 		c.followLeader(ctx, target)
+	} else if ri != nil && c.cfg.Mode != "observe" && !c.roOK.Load() {
+		// Already a replica (e.g. after a sidecar restart): make sure it
+		// is read-only once per process / after each promotion.
+		rctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+		c.ensureReadOnly(rctx)
+		cancel()
 	}
+}
+
+// ensureReadOnly sets replica-read-only=yes. Only promote turns it off.
+func (c *Controller) ensureReadOnly(ctx context.Context) {
+	if err := c.deps.KV.SetReadOnly(ctx, true); err != nil {
+		c.roOK.Store(false)
+		c.log.Error("setting replica read-only failed", map[string]any{"error": err.Error()})
+		return
+	}
+	c.roOK.Store(true)
 }
 
 // followTarget returns where to replicate from, or nil when lv does not
@@ -821,6 +838,7 @@ func (c *Controller) promote(ctx context.Context) {
 		c.log.Error("promote REPLICAOF NO ONE failed", map[string]any{"error": err.Error()})
 		return
 	}
+	c.roOK.Store(false) // Promote turned replica-read-only off
 	c.registerMaster(ctx)
 }
 
@@ -831,6 +849,7 @@ func (c *Controller) followLeader(ctx context.Context, lv *consulstore.LeaderVal
 	}
 	fctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
 	defer cancel()
+	c.ensureReadOnly(fctx)
 	if err := c.deps.KV.ReplicaOf(fctx, lv.Addr, lv.Port); err != nil {
 		if strings.Contains(err.Error(), "own replicas") {
 			// The new leader still lists us as its replica for a moment
@@ -895,6 +914,10 @@ func (c *Controller) fence(ctx context.Context, target *consulstore.LeaderValue)
 	}
 	kctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
 	defer cancel()
+	// Read-only before REPLICAOF: promotion turned it off, and a replica
+	// with replica-read-only=no keeps accepting writes while its link to
+	// the (fence) master is down.
+	c.ensureReadOnly(kctx)
 	if err := c.deps.KV.ReplicaOf(kctx, host, port); err != nil {
 		c.reg.Fencing.WithLabelValues(kind, "error").Inc()
 		c.setFencePending()

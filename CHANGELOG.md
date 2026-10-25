@@ -22,3 +22,10 @@
 - `handover` CLI no longer accepts `--token` (it leaks into shell history);
   use `$KVLOCK_ADMIN_TOKEN` or `--token-file`. The flag fails with exit 2
   without echoing its value.
+
+### Fixed
+- The sidecar now sets `slave-read-only yes` before every REPLICAOF (follow
+  and fence) and re-asserts it once when it finds the node already
+  following; only promotion turns it off. Previously a demoted ex-master
+  kept `slave-read-only no` from its promotion and accepted writes while
+  its replication link was down.
