@@ -82,3 +82,16 @@ func TestMaxLagDefaultsFollowBackendUnits(t *testing.T) {
 		t.Fatalf("epoch key %q", c.EpochKey())
 	}
 }
+
+func TestLagGateDefaults(t *testing.T) {
+	c, err := config.Parse([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.LagGateMaxWait != 0 || c.LagGateMaxBytes != 4<<20 {
+		t.Fatalf("defaults: max-wait %v max-bytes %d", c.LagGateMaxWait, c.LagGateMaxBytes)
+	}
+	if _, err := config.Parse([]string{"--lag-gate-max-bytes=-1"}); err == nil {
+		t.Fatal("negative max bytes must fail")
+	}
+}

@@ -44,11 +44,20 @@ type Snapshot struct {
 	MaxLagSeconds       float64 `json:"max_lag_seconds"`
 	MaxLagSeq           int64   `json:"max_lag_seq"`
 	// LagGate is the gate a promotion would use now: "time" or "seq".
-	LagGate      string   `json:"lag_gate"`
-	MasterHost   string   `json:"master_host,omitempty"`
-	MasterPort   int      `json:"master_port,omitempty"`
-	MasterLinkUp bool     `json:"master_link_up"`
-	Replicas     []string `json:"replicas,omitempty"`
+	LagGate string `json:"lag_gate"`
+	// MaxLagBytes is --lag-gate-max-bytes (0 = off).
+	MaxLagBytes int64 `json:"max_lag_bytes"`
+	// Promotable is false on the leader and on a replica that the lag gate
+	// would refuse now; PromoteBlocked says why.
+	Promotable     bool   `json:"promotable"`
+	PromoteBlocked string `json:"promote_blocked,omitempty"`
+	// PromotedDespiteLag is true while this node leads after a promotion
+	// forced by --lag-gate-max-wait (alert on it).
+	PromotedDespiteLag bool     `json:"promoted_despite_lag"`
+	MasterHost         string   `json:"master_host,omitempty"`
+	MasterPort         int      `json:"master_port,omitempty"`
+	MasterLinkUp       bool     `json:"master_link_up"`
+	Replicas           []string `json:"replicas,omitempty"`
 	// LastRenewAgeSeconds is the time since Consul last confirmed our
 	// session (-1 never).
 	LastRenewAgeSeconds float64        `json:"last_renew_age_seconds"`

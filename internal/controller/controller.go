@@ -94,6 +94,9 @@ type Controller struct {
 	// confirmation is based on it (a session renew alone does not show
 	// who holds the lock).
 	lastLockRead time.Time
+	// despiteLag is set when this node's current leadership came from a
+	// promotion forced by --lag-gate-max-wait.
+	despiteLag bool
 
 	hb     hbState
 	probed bool // the first tick has probed the local instance
@@ -183,6 +186,10 @@ func (c *Controller) Snapshot() httpapi.Snapshot {
 	} else if c.hb.havePeer {
 		s.LagGate = "time"
 	}
+	s.MaxLagBytes = c.cfg.LagGateMaxBytes
+	s.PromotedDespiteLag = c.despiteLag && c.role == elect.RoleLeader
+	s.PromoteBlocked = c.promoteBlockedLocked()
+	s.Promotable = c.role != elect.RoleLeader && s.PromoteBlocked == ""
 	s.LastRenewAgeSeconds = -1
 	if !c.lastRenewOK.IsZero() {
 		s.LastRenewAgeSeconds = time.Since(c.lastRenewOK).Seconds()
@@ -284,6 +291,10 @@ func (c *Controller) setRole(r elect.Role) {
 		c.reg.LeaderChanges.Inc()
 	}
 	metrics.SetBool(c.reg.IsLeader, r == elect.RoleLeader)
+	if r != elect.RoleLeader {
+		c.despiteLag = false
+	}
+	metrics.SetBool(c.reg.DespiteLagLeader, c.despiteLag && r == elect.RoleLeader)
 	c.mu.Unlock()
 	c.notify()
 }
@@ -829,7 +840,7 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		// the unknown-lag path requires the full hold-down — safe default.)
 		lastSeen = time.Now()
 	}
-	in := elect.LagGateInput{Lag: lag, MaxLag: c.cfg.MaxLagBytes, SampleAge: sampleAge, MaxSampleAge: c.cfg.LagSampleMaxAge,
+	in := elect.LagGateInput{Lag: lag, ByteLag: lag, MaxBytes: c.cfg.LagGateMaxBytes, MaxLag: c.cfg.MaxLagBytes, SampleAge: sampleAge, MaxSampleAge: c.cfg.LagSampleMaxAge,
 		LastSeen: lastSeen, HaveOld: haveOld, HoldDown: c.cfg.HoldDown, MaxWait: c.cfg.LagGateMaxWait, Now: time.Now()}
 	gate := "seq"
 	if haveOld && c.cfg.HeartbeatInterval > 0 {
@@ -857,7 +868,15 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		}
 		return
 	}
-	if lag > in.MaxLag {
+	forced := dec.Reason == elect.ReasonMaxWait
+	c.mu.Lock()
+	c.despiteLag = forced
+	c.mu.Unlock()
+	if forced {
+		c.reg.PromotedDespiteLag.Inc()
+		c.event("lag_gate", fmt.Sprintf("PROMOTING DESPITE LAG (%s gate, lag %s): --lag-gate-max-wait %s exceeded; unreplicated writes will be lost", gate, fmtLag(gate, lag), c.cfg.LagGateMaxWait))
+		c.log.Error("promoting despite lag", map[string]any{"gate": gate, "lag": lag, "byte_lag": in.ByteLag, "max_wait": c.cfg.LagGateMaxWait.String(), "reason": dec.Reason})
+	} else if lag > in.MaxLag {
 		c.log.Warn("promoting despite lag", map[string]any{"gate": gate, "lag": lag, "reason": dec.Reason})
 	} else if dec.Reason != "lag within bound" {
 		c.log.Warn("promoting with unknown lag", map[string]any{"gate": gate, "reason": dec.Reason})
@@ -1393,4 +1412,27 @@ func fmtLag(gate string, lag int64) string {
 		return (time.Duration(lag) * time.Millisecond).String()
 	}
 	return strconv.FormatInt(lag, 10) + " seq"
+}
+
+// promoteBlockedLocked says why this node could not promote right now
+// ("" = it could). It mirrors the lag gate for /status; it does not model
+// hold-down timing. Caller holds c.mu.
+func (c *Controller) promoteBlockedLocked() string {
+	switch {
+	case c.role == elect.RoleLeader:
+		return "this node is the leader"
+	case c.cfg.Mode == "observe":
+		return "observe mode"
+	case !c.kvUp:
+		return "kvrocks down"
+	case elect.OverByteCap(c.lag, c.cfg.LagGateMaxBytes):
+		return fmt.Sprintf("lag %d over lag-gate-max-bytes %d", c.lag, c.cfg.LagGateMaxBytes)
+	case c.hb.havePeer && c.hb.lag >= 0 && c.hb.lag > c.cfg.MaxLagTime:
+		return fmt.Sprintf("lag %s over max-lag-time %s", c.hb.lag, c.cfg.MaxLagTime)
+	case !c.hb.havePeer && c.lag > c.cfg.MaxLagBytes:
+		return fmt.Sprintf("lag %d over max-lag %d", c.lag, c.cfg.MaxLagBytes)
+	case c.lag < 0 && !(c.hb.havePeer && c.hb.lag >= 0):
+		return "lag unknown"
+	}
+	return ""
 }

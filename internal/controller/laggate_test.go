@@ -1,6 +1,7 @@
 package controller_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -87,5 +88,58 @@ func TestLagGateResamplesReachableOldLeader(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	if c.Snapshot().Role == elect.RoleLeader {
 		t.Fatalf("must refuse after a fresh sample shows lag %d", c.Snapshot().LagBytes)
+	}
+}
+
+// Over --lag-gate-max-bytes, a replica never promotes even after
+// --lag-gate-max-wait, and /status shows it as not promotable.
+func TestLagGateByteCapBlocksMaxWait(t *testing.T) {
+	cfg := testConfig("kv02")
+	cfg.HoldDown = time.Hour
+	cfg.LagGateMaxWait = 100 * time.Millisecond
+	cfg.LagGateMaxBytes = 4 << 20
+	kv := &fakeKV{up: true, role: "slave", masterHost: "10.0.0.1", masterPort: 6666, local: 10, peerOffset: 10 << 20}
+	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "sess-kv01", 2, time.Now()), sess: "sess-kv01"}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+	defer stop()
+	waitFor(t, 2*time.Second, func() bool { return c.Snapshot().LagBytes > 4<<20 })
+	if s := c.Snapshot(); s.Promotable || !strings.Contains(s.PromoteBlocked, "lag-gate-max-bytes") {
+		t.Fatalf("status must show not promotable: %v %q", s.Promotable, s.PromoteBlocked)
+	}
+	kv.mu.Lock()
+	kv.peerErr = errString("connection refused")
+	kv.mu.Unlock()
+	lock.mu.Lock()
+	lock.sess = ""
+	lock.mu.Unlock()
+	time.Sleep(600 * time.Millisecond)
+	if s := c.Snapshot(); s.Role == elect.RoleLeader || s.PromotedDespiteLag {
+		t.Fatal("over the byte cap must never promote")
+	}
+}
+
+// A forced promotion is flagged in /status.
+func TestLagGateMaxWaitFlagsDespiteLag(t *testing.T) {
+	cfg := testConfig("kv02")
+	cfg.HoldDown = time.Hour
+	cfg.LagGateMaxWait = 200 * time.Millisecond
+	cfg.LagGateMaxBytes = 4 << 20
+	kv := &fakeKV{up: true, role: "slave", masterHost: "10.0.0.1", masterPort: 6666, local: 10, peerOffset: 1_000_000}
+	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "sess-kv01", 2, time.Now()), sess: "sess-kv01"}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+	defer stop()
+	time.Sleep(80 * time.Millisecond)
+	if s := c.Snapshot(); s.Promotable {
+		t.Fatal("over --max-lag must show not promotable")
+	}
+	kv.mu.Lock()
+	kv.peerErr = errString("connection refused")
+	kv.mu.Unlock()
+	lock.mu.Lock()
+	lock.sess = ""
+	lock.mu.Unlock()
+	waitFor(t, 3*time.Second, func() bool { return c.Snapshot().Role == elect.RoleLeader })
+	if !c.Snapshot().PromotedDespiteLag {
+		t.Fatal("forced promotion must set promoted_despite_lag")
 	}
 }

@@ -49,6 +49,9 @@ type Config struct {
 	// LagGateMaxWait: promote a lagging replica anyway once the old leader
 	// has been gone this long. 0 = refuse until it returns.
 	LagGateMaxWait time.Duration
+	// LagGateMaxBytes: a replica whose offset lag is over this never
+	// promotes (LagGateMaxWait does not override it). 0 disables.
+	LagGateMaxBytes int64
 	// MaxLagTime is the heartbeat lag (time) a replica may be behind and
 	// still promote. The time gate is used whenever the departed leader's
 	// heartbeat was sampled; otherwise the offset gate (MaxLagBytes) applies.
@@ -256,7 +259,8 @@ func Parse(args []string) (*Config, error) {
 	fs.Int64Var(&c.MaxLagBytes, "max-lag", getenvInt64("MAX_LAG", getenvInt64("MAX_LAG_BYTES", -1)), "Max replication lag tolerated before refusing promotion, in the backend's offset units: write sequence numbers for kvrocks (default 1000), bytes for Redis (default 100MiB) ($MAX_LAG)")
 	fs.Int64Var(&c.MaxLagBytes, "max-lag-bytes", c.MaxLagBytes, "Old name for --max-lag ($MAX_LAG_BYTES)")
 	fs.DurationVar(&c.LagSampleMaxAge, "lag-sample-max-age", getenvDur("LAG_SAMPLE_MAX_AGE", 0), "Treat the leader offset sample as unknown lag if it was older than this when the leader disappeared; 0 = 3x --check-interval ($LAG_SAMPLE_MAX_AGE)")
-	fs.DurationVar(&c.LagGateMaxWait, "lag-gate-max-wait", getenvDur("LAG_GATE_MAX_WAIT", 5*time.Minute), "Promote a replica that is over --max-lag anyway once the old leader has been gone this long, accepting the loss of its unreplicated writes; 0 = wait forever ($LAG_GATE_MAX_WAIT)")
+	fs.DurationVar(&c.LagGateMaxWait, "lag-gate-max-wait", getenvDur("LAG_GATE_MAX_WAIT", 0), "Opt-in: promote a replica that is over --max-lag anyway once the old leader has been gone this long, accepting the loss of its unreplicated writes (logged and flagged as promoted despite lag); never overrides --lag-gate-max-bytes; 0 = never ($LAG_GATE_MAX_WAIT)")
+	fs.Int64Var(&c.LagGateMaxBytes, "lag-gate-max-bytes", getenvInt64("LAG_GATE_MAX_BYTES", 4<<20), "Hard cap on replication offset lag for promotion: a replica further behind never promotes until it catches up, regardless of --lag-gate-max-wait; offsets are bytes for Redis and write sequence numbers for kvrocks; 0 = off ($LAG_GATE_MAX_BYTES)")
 	fs.DurationVar(&c.MaxLagTime, "max-lag-time", getenvDur("MAX_LAG_TIME", 2*time.Second), "Max heartbeat lag (time behind the leader) tolerated before refusing promotion ($MAX_LAG_TIME)")
 	fs.DurationVar(&c.HeartbeatInterval, "heartbeat-interval", getenvDur("HEARTBEAT_INTERVAL", 250*time.Millisecond), "Leader writes the heartbeat key kvlock:hb:<cluster> this often; replicas read it at the same rate; 0 disables ($HEARTBEAT_INTERVAL)")
 	fs.DurationVar(&c.HoldDown, "hold-down", getenvDur("HOLD_DOWN", 30*time.Second), "Promote with unknown lag only if old master unreachable this long ($HOLD_DOWN)")
@@ -454,6 +458,9 @@ func Parse(args []string) (*Config, error) {
 	}
 	if c.LagGateMaxWait < 0 {
 		return nil, fmt.Errorf("--lag-gate-max-wait must be >= 0")
+	}
+	if c.LagGateMaxBytes < 0 {
+		return nil, fmt.Errorf("--lag-gate-max-bytes must be >= 0")
 	}
 	if c.MaxLagTime <= 0 {
 		return nil, fmt.Errorf("--max-lag-time must be > 0")

@@ -3,6 +3,32 @@
 ## v0.2.2 (unreleased)
 
 ### Added
+- `--lag-gate-max-bytes` (`$LAG_GATE_MAX_BYTES`, default 4MiB, 0 = off): a
+  replica whose offset lag is over it never promotes, even after
+  `--lag-gate-max-wait`. Offsets are bytes for Redis and write sequence
+  numbers for kvrocks.
+- A promotion forced by `--lag-gate-max-wait` logs an error, adds a status
+  event, increments `kvlock_promoted_despite_lag_total`, and sets the gauge
+  `kvlock_promoted_despite_lag` and `/status` `promoted_despite_lag` while
+  that node leads.
+- `/status` `promotable`, `promote_blocked` and `max_lag_bytes`.
+
+### Changed
+- `--lag-gate-max-wait` now defaults to 0: never promote despite lag. A
+  non-zero value is an opt-in override (it was 5m). It also bounds how long a
+  restarted former leader defers to a healthy peer, so that wait is now
+  unbounded by default while a healthy peer exists.
+
+### Fixed
+- The forwarder held clients for `--forward-hold` even when the answer was
+  final (e.g. on the leader). It now refuses at once and holds only while
+  the leader is unknown or changing.
+- A short gap in reading the leader key from Consul cut forwarder and proxy
+  routes. The last route is now kept while the epoch is unchanged and loss is
+  not known, up to the session TTL; followers verify the leader's kvrocks is
+  still master for that epoch, and an epoch change or confirmed loss still
+  cuts at once.
+- `/status` showed a replica far behind as ready to promote.
 - With `--forward`, kvlock sets `replica-announce-ip`/`-port` on its
   kvrocks (`--replica-announce`, `--replica-announce-ip`,
   `--replica-announce-port`), before REPLICAOF and again after a kvrocks

@@ -130,10 +130,28 @@ above is used. `/status` shows which gate would apply (`lag_gate`).
 Observe mode never writes the heartbeat; it only reads an existing key.
 Clients behind the proxy can see the key; it is tiny and rewritten in place.
 
-A replica over `--max-lag` refuses until the old leader comes back, or until
-it has been gone for `--lag-gate-max-wait` (default 5m). After that it promotes
-anyway, and the writes the old leader never replicated are lost. Set it to 0
-to wait forever.
+A replica over `--max-lag` refuses until it catches up or the old leader
+comes back. By default (`--lag-gate-max-wait 0`) it never promotes despite
+lag. A non-zero `--lag-gate-max-wait` is an opt-in override: once the old
+leader has been gone that long the replica promotes anyway and the writes the
+old leader never replicated are lost. Such a promotion logs an error
+("promoting despite lag"), adds a `lag_gate` event, increments
+`kvlock_promoted_despite_lag_total`, sets the gauge
+`kvlock_promoted_despite_lag` to 1 and `/status` `promoted_despite_lag` to
+true for as long as that node stays leader. Alert on them.
+
+`--lag-gate-max-bytes` (default 4194304, 4MiB; 0 = off) is a hard cap on top
+of the gates above: a replica whose offset lag is over it never promotes, and
+`--lag-gate-max-wait` cannot force it; it waits until it has caught up to
+within the cap. At or under the cap the other gates still decide (the cap is
+necessary, not sufficient). The lag is the backend offset difference
+(`lag_bytes` in `/status`): bytes for Redis, but write sequence numbers for
+kvrocks, so for kvrocks the value counts writes, not bytes.
+
+`/status` reports `promotable` (false on the leader and on a replica the gate
+would refuse now) and `promote_blocked` with the reason, e.g. lag over
+`--lag-gate-max-bytes`, `--max-lag-time` or `--max-lag`. It does not model the
+hold-down timer. The status page shows this next to the promotion gate.
 
 ### Running against standalone Redis
 
@@ -178,7 +196,7 @@ a Nomad sidecar so it is restarted with kvrocks.
 | Consul outage longer than TTL | Leader fences itself; sessions re-created on return; re-election with backoff | ~outage + seconds |
 | SIGTERM on leader | Deregister, fence, kill clients, release | ~1–2s |
 | Both start simultaneously | Empty key race; Consul acquire is atomic — one wins, epoch 1 | ~seconds |
-| Replica far behind (`lag > --max-lag`) | Promotion refused, stays follower, warns; retries each tick; promotes after `--lag-gate-max-wait` (default 5m, 0 = never) | ≤ max wait, loses the unreplicated writes |
+| Replica far behind (`lag > --max-lag`) | Promotion refused, stays follower, warns; retries each tick; never promotes by default; with an opt-in `--lag-gate-max-wait` promotes after it (flagged `promoted_despite_lag`), but never while over `--lag-gate-max-bytes` | none by default; with max wait set, loses the unreplicated writes |
 | Lag unknown + old master recently seen | Refused until `--hold-down` (default 30s) elapses | ≤ hold-down |
 
 ## Running

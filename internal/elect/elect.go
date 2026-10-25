@@ -5,6 +5,7 @@ package elect
 
 import (
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"net"
 	"strconv"
@@ -63,14 +64,31 @@ type LagGateInput struct {
 	HoldDown     time.Duration
 	// MaxWait bounds how long a known-too-far-behind replica refuses: once
 	// the old leader has been gone this long, promote anyway. 0 = never.
+	// It never overrides the MaxBytes cap.
 	MaxWait time.Duration
 	Now     time.Time
+	// ByteLag is the backend offset lag (< 0 unknown). MaxBytes > 0 is a
+	// hard cap: a replica known to be further behind never promotes, no
+	// matter how long it has waited.
+	ByteLag  int64
+	MaxBytes int64
+}
+
+// ReasonMaxWait is the decision reason when MaxWait forces a promotion.
+const ReasonMaxWait = "lag gate max wait exceeded; promoting behind the last known master"
+
+// OverByteCap reports whether a known byte lag exceeds a non-zero cap.
+func OverByteCap(byteLag, maxBytes int64) bool {
+	return maxBytes > 0 && byteLag > maxBytes
 }
 
 // LagGate decides whether a replica may promote. It extends ShouldPromote
 // with sample staleness (a sample older than MaxSampleAge counts as unknown
 // lag, so the hold-down applies) and a bounded wait for a lagging replica.
 func LagGate(in LagGateInput) PromotionDecision {
+	if OverByteCap(in.ByteLag, in.MaxBytes) {
+		return PromotionDecision{false, fmt.Sprintf("replica %d behind, over lag-gate-max-bytes %d; waiting to catch up", in.ByteLag, in.MaxBytes)}
+	}
 	lag := in.Lag
 	stale := false
 	// Only a sample that looks good can mislead: a stale sample understates
@@ -83,7 +101,7 @@ func LagGate(in LagGateInput) PromotionDecision {
 		d.Reason = "leader offset sample stale; " + d.Reason
 	}
 	if !d.Allow && lag > in.MaxLag && in.MaxWait > 0 && in.HaveOld && !in.LastSeen.IsZero() && in.Now.Sub(in.LastSeen) >= in.MaxWait {
-		return PromotionDecision{true, "lag gate max wait exceeded; promoting behind the last known master"}
+		return PromotionDecision{true, ReasonMaxWait}
 	}
 	return d
 }

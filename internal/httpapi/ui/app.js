@@ -50,7 +50,9 @@
     var lagCls = s.lag_seconds < 0 ? "" : (s.lag_seconds > s.max_lag_seconds ? "err" : "ok");
     set("lag_time", s.role === "leader" ? "0 (leader)" : dur(s.lag_seconds) + " (max " + dur(s.max_lag_seconds) + ")", lagCls);
     set("lag_seq", s.lag_bytes < 0 ? "unknown" : s.lag_bytes + " (max " + s.max_lag_seq + ")");
-    set("gate", s.lag_gate);
+    set("gate", s.role === "leader" ? s.lag_gate + (s.promoted_despite_lag ? " (PROMOTED DESPITE LAG)" : "") :
+      s.lag_gate + (s.promotable ? " (ready)" : " (not ready: " + (s.promote_blocked || "unknown") + ")"),
+      s.promoted_despite_lag || (s.role !== "leader" && !s.promotable) ? "err" : "ok");
     renderBackup(s.backup);
     set("healthy", yes(s.healthy), s.healthy ? "ok" : "err");
     set("kv_up", yes(s.kvrocks_up), s.kvrocks_up ? "ok" : "err");

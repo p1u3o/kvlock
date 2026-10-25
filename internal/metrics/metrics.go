@@ -43,6 +43,10 @@ type Registry struct {
 	HeartbeatAge prometheus.Gauge
 	Heartbeats   *prometheus.CounterVec // result=ok|error
 	LagRefusals  prometheus.Counter
+	// PromotedDespiteLag counts promotions forced by --lag-gate-max-wait;
+	// DespiteLagLeader is 1 while this node leads after such a promotion.
+	PromotedDespiteLag prometheus.Counter
+	DespiteLagLeader   prometheus.Gauge
 
 	Elections      prometheus.Counter
 	LeaderAcquired prometheus.Counter
@@ -86,6 +90,8 @@ func New() *Registry {
 	r.HeartbeatAge = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "heartbeat_age_seconds", Help: "Local clock minus the newest heartbeat in the local instance (includes clock skew); -1 unknown."})
 	r.Heartbeats = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "heartbeat_writes_total", Help: "Heartbeat writes by the leader, by result."}, []string{"result"})
 	r.LagRefusals = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "lag_gate_refusals_total", Help: "Promotions refused by the lag gate."})
+	r.PromotedDespiteLag = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "promoted_despite_lag_total", Help: "Promotions forced by --lag-gate-max-wait while the replica was over --max-lag (writes may have been lost)."})
+	r.DespiteLagLeader = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "promoted_despite_lag", Help: "1 while this node is leader after a promotion forced despite lag."})
 	r.Elections = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "elections_total", Help: "Lock acquisition attempts."})
 	r.LeaderAcquired = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "leader_acquired_total", Help: "Times this node won the lock (failovers/handovers onto this node)."})
 	r.LeaderChanges = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "leader_changes_total", Help: "Local role transitions."})
@@ -116,7 +122,7 @@ func New() *Registry {
 
 	r.prom.MustRegister(r.IsLeader, r.BackendUp, r.ReplicationLag, r.Elections, r.LeaderAcquired, r.LeaderChanges,
 		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, r.ProxyActive, r.ProxyDropped, r.ProxyRefused, r.ProxyAccepted, r.ProxyBytes, r.ProxyResets, renew, held,
-		r.LagSeconds, r.HeartbeatAge, r.Heartbeats, r.LagRefusals,
+		r.LagSeconds, r.HeartbeatAge, r.Heartbeats, r.LagRefusals, r.PromotedDespiteLag, r.DespiteLagLeader,
 		r.BackupLastSuccess, r.BackupLastSize, r.BackupDuration, r.BackupFailures, r.WatchdogWrites,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
