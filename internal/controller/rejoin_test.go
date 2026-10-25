@@ -1,6 +1,9 @@
 package controller_test
 
 import (
+	"context"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -125,5 +128,70 @@ func TestRefusedAcquireDoesNotBumpEpoch(t *testing.T) {
 	defer lock.mu.Unlock()
 	if lv := elect.ParseLeader(lock.val); lv == nil || lv.Epoch != 11 || lock.epoch != 11 || lock.bumps != 1 {
 		t.Fatalf("expected epoch 11 bumped once, got value=%+v counter=%d bumps=%d", lv, lock.epoch, lock.bumps)
+	}
+}
+
+// presenceLock adds session-held member keys to fakeLock.
+type presenceLock struct {
+	*fakeLock
+	pmu     sync.Mutex
+	members map[string]string // key -> value, all held
+}
+
+func (p *presenceLock) Acquire(ctx context.Context, key, sess string, v []byte) (bool, error) {
+	if strings.Contains(key, "/members/") {
+		p.pmu.Lock()
+		defer p.pmu.Unlock()
+		p.members[key] = string(v)
+		return true, nil
+	}
+	return p.fakeLock.Acquire(ctx, key, sess, v)
+}
+
+func (p *presenceLock) Members(ctx context.Context, prefix string) ([]string, error) {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	var out []string
+	for k, v := range p.members {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+// The catalog filters out peers whose node the token cannot read, so the
+// health API can show only this node. The member key still shows the peer.
+func TestRestartedLeaderDefersToPeerMemberKey(t *testing.T) {
+	cfg := testConfig("kv01")
+	cfg.LagGateMaxWait = time.Minute
+	kv := fencedKV()
+	base := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "sess-old", 4, time.Now()), epoch: 4}
+	lock := &presenceLock{fakeLock: base, members: map[string]string{cfg.MembersPrefix() + "kv02": "kv02"}}
+	reg := &fakeRegistrar{peers: []consulstore.Instance{{ID: "kvrocks-kv01", Node: "kv01"}}}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: reg, KV: kv})
+	time.Sleep(250 * time.Millisecond)
+	stop()
+	if c.Snapshot().Role == elect.RoleLeader || kv.promotions != 0 || base.epoch != 4 {
+		t.Fatalf("must defer to the peer's member key: role=%v promotions=%d epoch=%d", c.Snapshot().Role, kv.promotions, base.epoch)
+	}
+	lock.pmu.Lock()
+	own := lock.members[cfg.MembersPrefix()+"kv01"]
+	lock.pmu.Unlock()
+	if own != "kv01" {
+		t.Fatalf("own member key not published: %q", own)
+	}
+}
+
+func TestOwnMemberKeyIsNotAPeer(t *testing.T) {
+	cfg := testConfig("kv01")
+	kv := fencedKV()
+	base := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "sess-old", 4, time.Now()), epoch: 4}
+	lock := &presenceLock{fakeLock: base, members: map[string]string{}}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+	time.Sleep(250 * time.Millisecond)
+	stop()
+	if c.Snapshot().Role != elect.RoleLeader || base.epoch != 5 {
+		t.Fatalf("alone, the former leader must take over: role=%v epoch=%d", c.Snapshot().Role, base.epoch)
 	}
 }

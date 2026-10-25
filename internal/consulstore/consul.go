@@ -75,6 +75,15 @@ type PeerHealth interface {
 	HealthyInstances(ctx context.Context, service, tag string) ([]Instance, error)
 }
 
+// Presence is an optional extension of Lock: every sidecar holds a
+// session-bound member key, so a live session means a live sidecar with a
+// healthy local kvrocks. Unlike the health API this needs no node:read
+// ACL on the peer's node (Consul filters those entries out silently).
+type Presence interface {
+	// Members returns the values of keys under prefix that a session holds.
+	Members(ctx context.Context, prefix string) ([]string, error)
+}
+
 // Lock is the KV leader key with session-based acquire.
 type Lock interface {
 	// Acquire tries to hold key with session+value. Returns held?

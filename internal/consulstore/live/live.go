@@ -164,6 +164,22 @@ func (l *Client) BumpEpoch(ctx context.Context, key string, min uint64) (uint64,
 }
 
 // CurrentEpoch reads the epoch counter without changing it.
+// Members lists the values of session-held keys under prefix.
+func (l *Client) Members(ctx context.Context, prefix string) ([]string, error) {
+	q := (&consul.QueryOptions{RequireConsistent: true}).WithContext(ctx)
+	pairs, _, err := l.c.KV().List(prefix, q)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range pairs {
+		if p != nil && p.Session != "" {
+			out = append(out, string(p.Value))
+		}
+	}
+	return out, nil
+}
+
 func (l *Client) CurrentEpoch(ctx context.Context, key string) (uint64, error) {
 	p, _, err := l.c.KV().Get(key, (&consul.QueryOptions{}).WithContext(ctx))
 	if err != nil || p == nil {

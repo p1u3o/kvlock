@@ -72,23 +72,13 @@ func (c *Controller) deferToPeer(ctx context.Context, ri *kvrocks.ReplicationInf
 		c.log.Warn("rejoin wait over; running for leader", map[string]any{"waited": time.Since(since).String()})
 		return false
 	}
-	ph, ok := c.deps.Registrar.(consulstore.PeerHealth)
-	if !ok {
-		return false
-	}
-	insts, err := ph.HealthyInstances(ctx, c.cfg.ServiceName, "")
+	peer, err := c.livePeer(ctx)
 	if err != nil {
 		c.log.Warn("could not list healthy peers; running for leader", map[string]any{"error": err.Error()})
 		return false
 	}
-	peer := ""
-	for _, in := range insts {
-		if in.ID != "" && in.ID != c.serviceID() {
-			peer = in.ID
-			break
-		}
-	}
 	if peer == "" {
+		c.observeLog("no healthy peer found; running for leader", nil)
 		return false
 	}
 	c.setRole(elect.RoleFollower)
@@ -98,4 +88,54 @@ func (c *Controller) deferToPeer(ctx context.Context, ri *kvrocks.ReplicationInf
 	}
 	c.observeLog("not running for leader: restarted former leader defers to healthy peer", map[string]any{"peer": peer})
 	return true
+}
+
+// publishMember holds this node's member key with the current session.
+func (c *Controller) publishMember(ctx context.Context, sid string) {
+	if _, ok := c.deps.Lock.(consulstore.Presence); !ok {
+		return
+	}
+	c.mu.RLock()
+	done := c.memberSID == sid
+	c.mu.RUnlock()
+	if done {
+		return
+	}
+	ok, err := c.deps.Lock.Acquire(ctx, c.cfg.MembersPrefix()+c.cfg.NodeName, sid, []byte(c.cfg.NodeName))
+	if err != nil || !ok {
+		return
+	}
+	c.mu.Lock()
+	c.memberSID = sid
+	c.mu.Unlock()
+}
+
+// livePeer names another live sidecar: a member key held by a session,
+// else a passing catalog instance. Empty when none is known.
+func (c *Controller) livePeer(ctx context.Context) (string, error) {
+	if pr, ok := c.deps.Lock.(consulstore.Presence); ok {
+		ms, err := pr.Members(ctx, c.cfg.MembersPrefix())
+		if err != nil {
+			return "", err
+		}
+		for _, m := range ms {
+			if m != "" && m != c.cfg.NodeName {
+				return m, nil
+			}
+		}
+	}
+	ph, ok := c.deps.Registrar.(consulstore.PeerHealth)
+	if !ok {
+		return "", nil
+	}
+	insts, err := ph.HealthyInstances(ctx, c.cfg.ServiceName, "")
+	if err != nil {
+		return "", err
+	}
+	for _, in := range insts {
+		if in.ID != "" && in.ID != c.serviceID() {
+			return in.ID, nil
+		}
+	}
+	return "", nil
 }

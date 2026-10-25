@@ -381,6 +381,12 @@ func (c *Config) EpochKey() string {
 
 // HeartbeatKey is the key the leader writes into its kvrocks so replicas
 // can measure lag in time. It replicates like any other write.
+// MembersPrefix holds one session-bound key per live sidecar.
+func (c *Config) MembersPrefix() string {
+	k := c.LeaderKey()
+	return k[:len(k)-len("leader")] + "members/"
+}
+
 func (c *Config) HeartbeatKey() string { return "kvlock:hb:" + c.Cluster }
 
 func bytesTrim(b []byte) []byte {

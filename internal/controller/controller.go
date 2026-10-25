@@ -69,6 +69,7 @@ type Controller struct {
 	// replicated from a new leader. rejoinSince bounds that wait.
 	rejoin      bool
 	rejoinSince time.Time
+	memberSID   string // session our member key was last acquired with
 	// lastRenewOK is the last time Consul confirmed our session (create or
 	// renew). The leader tolerates Consul errors until ~SessionTTL past it.
 	lastRenewOK time.Time
@@ -446,6 +447,7 @@ func (c *Controller) tick(ctx context.Context) {
 	if sid == "" {
 		return
 	}
+	c.publishMember(ctx, sid)
 
 	// 2. Read current leader. Leadership is decided by which session holds
 	// the key, never by the node name in the value: the value survives a
@@ -1085,13 +1087,22 @@ func (c *Controller) watchLoop(ctx context.Context) {
 		}
 		idx = nidx
 		c.mu.Lock()
-		if sess == "" {
-			c.leader = nil // vacant: next tick attempts election
+		vacant := sess == ""
+		if vacant {
+			c.leader = nil
 		} else {
 			c.leader = elect.ParseLeader(raw)
 		}
 		c.mu.Unlock()
 		c.notify()
+		if vacant {
+			// Run a tick now instead of waiting for the next interval, so
+			// a healthy replica takes over as soon as the key is free.
+			select {
+			case c.cmds <- func(ctx context.Context) { c.tick(ctx) }:
+			default:
+			}
+		}
 	}
 }
 
