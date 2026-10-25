@@ -163,6 +163,16 @@ func (l *Client) BumpEpoch(ctx context.Context, key string, min uint64) (uint64,
 	return 0, errors.New("epoch counter: check-and-set kept losing")
 }
 
+// CurrentEpoch reads the epoch counter without changing it.
+func (l *Client) CurrentEpoch(ctx context.Context, key string) (uint64, error) {
+	p, _, err := l.c.KV().Get(key, (&consul.QueryOptions{}).WithContext(ctx))
+	if err != nil || p == nil {
+		return 0, err
+	}
+	n, _ := strconv.ParseUint(strings.TrimSpace(string(p.Value)), 10, 64)
+	return n, nil
+}
+
 // Put writes key without a session.
 func (l *Client) Put(ctx context.Context, key string, value []byte) error {
 	_, err := l.c.KV().Put(&consul.KVPair{Key: key, Value: value}, (&consul.WriteOptions{}).WithContext(ctx))
@@ -292,11 +302,7 @@ func (l *Client) Deregister(ctx context.Context, serviceID string) error {
 func (l *Client) CheckID(serviceID string) string { return "service:" + serviceID }
 
 // Instance is a healthy catalog entry.
-type Instance struct {
-	Node string
-	Addr string
-	Port int
-}
+type Instance = consulstore.Instance
 
 // HealthyInstances lists passing instances of service carrying tag.
 func (l *Client) HealthyInstances(ctx context.Context, service, tag string) ([]Instance, error) {
@@ -314,7 +320,7 @@ func (l *Client) HealthyInstances(ctx context.Context, service, tag string) ([]I
 		if e.Node != nil {
 			node = e.Node.Node
 		}
-		out = append(out, Instance{Node: node, Addr: addr, Port: e.Service.Port})
+		out = append(out, Instance{ID: e.Service.ID, Node: node, Addr: addr, Port: e.Service.Port})
 	}
 	return out, nil
 }

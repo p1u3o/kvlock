@@ -63,6 +63,12 @@ type Controller struct {
 	fencePending   bool
 	rsidDone       bool // use-rsid-psync applied (or not applicable)
 	lastLeaderSeen time.Time
+	// rejoin is set when this sidecar finds the lock or its value left by
+	// an earlier incarnation on this node (it restarted while leader). Its
+	// lag is unknown, so it leaves the lock to a healthy peer until it has
+	// replicated from a new leader. rejoinSince bounds that wait.
+	rejoin      bool
+	rejoinSince time.Time
 	// lastRenewOK is the last time Consul confirmed our session (create or
 	// renew). The leader tolerates Consul errors until ~SessionTTL past it.
 	lastRenewOK time.Time
@@ -276,6 +282,9 @@ func (c *Controller) Run(ctx context.Context) {
 	if c.cfg.SessionTTL/3 < time.Second {
 		ttlTicker.Reset(time.Second)
 	}
+	// First step right away rather than one check interval in: after a
+	// restart this is what hands a stale lock back or follows the leader.
+	c.tick(ctx)
 
 	for {
 		select {
@@ -548,6 +557,7 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 			if lv.Node == c.cfg.NodeName {
 				c.lastLeader = nil
 				c.lastLeaderSeen = time.Time{}
+				c.markRejoinLocked()
 			} else {
 				c.lastLeader = lv
 			}
@@ -571,6 +581,9 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 		c.updateLag(ri)
 		c.tryBecomeLeader(ctx, raw, ri, old, seen)
 	default: // held by another session
+		if lv != nil && lv.Node == c.cfg.NodeName && c.releaseStaleSelf(ctx, ri, holder) {
+			return // the next tick sees the key vacant
+		}
 		c.mu.Lock()
 		c.leader = lv
 		if lv != nil {
@@ -647,6 +660,9 @@ func (c *Controller) onFollow(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 		}
 		return
 	}
+	if ri != nil && ri.Role == "slave" && ri.MasterHost == target.Addr && ri.MasterPort == target.Port && ri.MasterLinkUp {
+		c.clearRejoin(lv)
+	}
 	if ri != nil && !(ri.Role == "slave" && ri.MasterHost == target.Addr && ri.MasterPort == target.Port) {
 		c.followLeader(ctx, target)
 	} else if ri != nil && c.cfg.Mode != "observe" && !c.roOK.Load() {
@@ -698,6 +714,9 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	if len(raw) == 0 && ri != nil && ri.Role == "slave" && ri.MasterLinkUp {
 		c.setRole(elect.RoleFollower)
 		c.observeLog("not running for leader: local instance replicates from a live master", map[string]any{"master_host": ri.MasterHost, "master_port": ri.MasterPort})
+		return
+	}
+	if c.deferToPeer(ctx, ri) {
 		return
 	}
 	// Flapping guard: backoff with jitter between attempts.
@@ -774,14 +793,16 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 	} else if dec.Reason != "lag within bound" {
 		c.log.Warn("promoting with unknown lag", map[string]any{"gate": gate, "reason": dec.Reason})
 	}
-	if ec, ok := c.deps.Lock.(consulstore.EpochCounter); ok && c.cfg.Mode != "observe" {
-		// The counter key is never released or rewritten by anyone else,
-		// so epochs keep rising even if the leader value was lost.
-		n, err := ec.BumpEpoch(ctx, c.cfg.EpochKey(), epoch)
-		if err != nil {
-			c.log.Warn("epoch counter bump failed; using epoch from leader value", map[string]any{"error": err.Error()})
-		} else {
-			epoch = n
+	ec, useCounter := c.deps.Lock.(consulstore.EpochCounter)
+	useCounter = useCounter && c.cfg.Mode != "observe"
+	if useCounter {
+		// Propose one above the counter but only store it once the lock is
+		// ours: a refused acquire (lock-delay, someone else won) must not
+		// use up epochs.
+		if cur, err := ec.CurrentEpoch(ctx, c.cfg.EpochKey()); err != nil {
+			c.log.Warn("epoch counter read failed; using epoch from leader value", map[string]any{"error": err.Error()})
+		} else if cur+1 > epoch {
+			epoch = cur + 1
 		}
 	}
 	value := elect.MarshalLeader(c.cfg.NodeName, c.cfg.AdvertiseAddr, c.cfg.AdvertiseAddrPrivate, c.cfg.AdvertisePort, c.sessionIDValue(), epoch, time.Now())
@@ -809,6 +830,23 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 			c.fence(ctx, nil)
 		}
 		return
+	}
+	if useCounter {
+		// The counter key is never released or rewritten by anyone else,
+		// so epochs keep rising even if the leader value was lost.
+		n, err := ec.BumpEpoch(ctx, c.cfg.EpochKey(), epoch)
+		switch {
+		case err != nil:
+			c.log.Warn("epoch counter bump failed; keeping epoch from leader value", map[string]any{"error": err.Error(), "epoch": epoch})
+		case n != epoch:
+			// Someone stored a higher epoch between our read and acquire;
+			// do not lead under a number another leader may also hold.
+			c.log.Warn("epoch counter moved during acquire; giving the lock back", map[string]any{"proposed": epoch, "counter": n})
+			if err := c.deps.Lock.Release(ctx, c.cfg.LeaderKey(), sid); err != nil {
+				c.log.Warn("release after epoch race failed", map[string]any{"error": err.Error()})
+			}
+			return
+		}
 	}
 	c.promote(ctx)
 	c.mu.Lock()

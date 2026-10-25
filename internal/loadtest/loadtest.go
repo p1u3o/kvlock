@@ -137,6 +137,9 @@ type runner struct {
 	tl      []string
 	errKind map[string]int64
 
+	discovering  atomic.Bool
+	lastDiscover time.Time // guarded by mu
+
 	writes, writeErr, reads, readErr, stale atomic.Int64
 	seq                                     atomic.Int64
 
@@ -209,12 +212,40 @@ func (r *runner) currentMaster() string {
 	return r.master
 }
 
+// cmdErr is the outcome of one pipelined command. go-redis leaves the
+// per-command error unset when the pipeline fails before any reply is read
+// (dial error, pool timeout, write error), so a nil Err() alone does not
+// mean the server answered: without this, failed writes count as acked
+// and failed reads as empty (seq 0) values.
+func cmdErr(cmd redis.Cmder, execErr error) error {
+	if err := cmd.Err(); err != nil {
+		return err
+	}
+	if execErr == nil {
+		return nil
+	}
+	var re redis.Error
+	if errors.As(execErr, &re) {
+		// A server reply to another command (READONLY, nil, ...): this one
+		// got its own reply.
+		return nil
+	}
+	return execErr
+}
+
 func (r *runner) rediscover(ctx context.Context, failed string) {
+	// One lookup at a time and at most every 100ms: every worker failing
+	// at once must not open a burst of connections to each address.
+	if !r.discovering.CompareAndSwap(false, true) {
+		return
+	}
+	defer r.discovering.Store(false)
 	r.mu.Lock()
-	if r.master != failed {
+	if r.master != failed || time.Since(r.lastDiscover) < 100*time.Millisecond {
 		r.mu.Unlock()
 		return
 	}
+	r.lastDiscover = time.Now()
 	r.mu.Unlock()
 	m, err := r.findMaster(ctx)
 	if err != nil || m == failed && len(r.cfg.Addrs) > 1 {
@@ -347,13 +378,13 @@ func (r *runner) worker(ctx context.Context, w int, rng *rand.Rand, pad string) 
 			}
 		}
 		t0 := time.Now()
-		_, _ = pipe.Exec(c)
+		_, execErr := pipe.Exec(c)
 		cancel()
 		now := time.Now()
 		r.lat[w] = append(r.lat[w], now.Sub(t0))
 		failed := false
 		for i, o := range ops {
-			err := cmds[i].Err()
+			err := cmdErr(cmds[i], execErr)
 			if o.write {
 				if err != nil {
 					r.writeErr.Add(1)

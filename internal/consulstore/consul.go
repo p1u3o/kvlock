@@ -56,6 +56,23 @@ type EpochCounter interface {
 	// BumpEpoch atomically stores and returns a value greater than the
 	// stored counter and at least min.
 	BumpEpoch(ctx context.Context, key string, min uint64) (uint64, error)
+	// CurrentEpoch returns the stored counter (0 when the key is missing)
+	// without changing it.
+	CurrentEpoch(ctx context.Context, key string) (uint64, error)
+}
+
+// Instance is a passing catalog entry of a service.
+type Instance struct {
+	ID   string // service ID
+	Node string
+	Addr string
+	Port int
+}
+
+// PeerHealth is an optional extension of Registrar: the passing instances
+// of a service, used to tell whether another sidecar is alive.
+type PeerHealth interface {
+	HealthyInstances(ctx context.Context, service, tag string) ([]Instance, error)
 }
 
 // Lock is the KV leader key with session-based acquire.

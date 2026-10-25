@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/p1u3o/kvlock/internal/config"
+	"github.com/p1u3o/kvlock/internal/consulstore"
 	"github.com/p1u3o/kvlock/internal/controller"
 	"github.com/p1u3o/kvlock/internal/elect"
 	"github.com/p1u3o/kvlock/internal/kvrocks"
@@ -25,6 +26,7 @@ type fakeSession struct {
 	renewErr  error
 	valid     bool
 	destroyed bool
+	other     []string
 }
 
 func (f *fakeSession) Create(ctx context.Context, ttl, ld time.Duration) (string, error) {
@@ -48,6 +50,10 @@ func (f *fakeSession) Renew(ctx context.Context, id string) error {
 func (f *fakeSession) Destroy(ctx context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if id != f.id {
+		f.other = append(f.other, id) // e.g. a previous incarnation's session
+		return nil
+	}
 	f.destroyed = true
 	f.valid = false
 	return nil
@@ -73,11 +79,20 @@ type fakeLock struct {
 	getErr    error
 	epoch     uint64 // separate counter key, as in live.BumpEpoch
 	onRelease func()
+	refuse    bool // Acquire fails, as under Consul lock-delay
+	bumps     int
+}
+
+func (f *fakeLock) CurrentEpoch(ctx context.Context, key string) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.epoch, nil
 }
 
 func (f *fakeLock) BumpEpoch(ctx context.Context, key string, min uint64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.bumps++
 	f.epoch++
 	if f.epoch < min {
 		f.epoch = min
@@ -89,7 +104,7 @@ func (f *fakeLock) Acquire(ctx context.Context, key, sess string, v []byte) (boo
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.acquires++
-	if f.sess != "" && f.sess != sess {
+	if f.refuse || (f.sess != "" && f.sess != sess) {
 		return false, nil
 	}
 	f.val = v
@@ -128,6 +143,13 @@ type fakeRegistrar struct {
 	master, replica int
 	dereg           int
 	failed, passed  int
+	peers           []consulstore.Instance
+}
+
+func (f *fakeRegistrar) HealthyInstances(ctx context.Context, service, tag string) ([]consulstore.Instance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]consulstore.Instance(nil), f.peers...), nil
 }
 
 func (f *fakeRegistrar) RegisterMaster(ctx context.Context, s, n, a string, p int, t []string, ttl time.Duration) error {
@@ -459,7 +481,9 @@ func TestNodeNameAloneDoesNotGrantLeadership(t *testing.T) {
 	cfg := testConfig("kv01")
 	kv := &fakeKV{up: true, role: "master"}
 	lock := &fakeLock{val: elect.MarshalLeader("kv01", "10.0.0.1", "", 6666, "sess-old", 4, time.Now()), sess: "sess-old"}
-	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+	// kv02 is healthy, so after releasing the stale session kv01 defers.
+	reg := &fakeRegistrar{peers: []consulstore.Instance{{ID: "kvrocks-kv02", Node: "kv02"}}}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: reg, KV: kv})
 	time.Sleep(150 * time.Millisecond)
 	stop()
 	if c.Snapshot().Role == elect.RoleLeader {
