@@ -457,6 +457,28 @@ Clients should list the proxy on both nodes (`kv01:6380,kv02:6380`) or use
 the Consul name, so losing one host only costs a reconnect. Each hop adds a
 little latency; connections are long-lived, so pooling clients are fine.
 
+## Replication forwarder (optional, dynamic ports)
+
+Off by default. With `--forward`, kvlock listens on a fixed loopback
+address (default `127.0.1.1:18379`) and forwards to the current leader's
+advertised address, which can be a Nomad dynamic port taken from
+`--advertise-nomad-label`. Replicas run `REPLICAOF` to that address once.
+
+- When the leader, session or epoch changes, every forwarded connection
+  is cut and new ones go to the new leader.
+- A connection that arrives during the gap is held for up to
+  `--forward-hold` (default 5s).
+- The leader's own forwarder refuses connections.
+
+`--peer-expose` gives each of N instances a stable address
+`127.0.2.<NOMAD_ALLOC_INDEX>:18379`. It is used for status and for the
+pre-promotion offset check.
+
+Design, the kvrocks self-replication analysis, every config key and a
+Nomad jobspec are in [docs/forwarder.md](docs/forwarder.md). The
+kvlock-test rollout plan is in
+[docs/forwarder-test-plan.md](docs/forwarder-test-plan.md).
+
 ## Sentinel-compatible endpoint
 
 `--sentinel-addr :26379` (`$SENTINEL_ADDR`) serves a read-only subset of

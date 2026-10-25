@@ -3,6 +3,23 @@
 ## v0.2.2 (unreleased)
 
 ### Added
+- Optional replication forwarder (`--forward`, `--forward-addr`,
+  `--forward-hold`):
+  - It listens on a fixed loopback address and forwards to the current
+    leader, so kvrocks can run on dynamic ports. Replicas run REPLICAOF
+    to it once.
+  - Connections are cut on any leader, session or epoch change. New
+    connections are held while no leader is known. The leader refuses.
+  - `/status` and `kvrocks-leader status` show its state.
+  - New metrics: `kvlock_proxy_connections_total`,
+    `kvlock_proxy_bytes_total` and `kvlock_proxy_route_resets_total`.
+- `--advertise-nomad-label` takes the advertised address from
+  `$NOMAD_HOST_ADDR_<label>`.
+- Optional peer addresses (`--peer-expose`, `--peer-base`, `--peer-port`,
+  `--alloc-index`):
+  - Each instance is reachable at `127.0.2.<alloc index>`.
+  - The index and address are published in the member key.
+  - The pre-promotion leader-offset sample uses this address.
 - `kvrocks-leader watchdog`: fences the local kvrocks (read-only, REPLICAOF
   to an unroutable target, optional client kill, confirmed by a write probe)
   when the sidecar heartbeat file goes stale while the node is a writable
