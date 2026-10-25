@@ -109,6 +109,15 @@ type Config struct {
 	// NOMAD_HOST_ADDR_<label> (Nomad dynamic ports). Explicit
 	// --advertise-addr / --advertise-port still win.
 	AdvertiseNomadLabel string
+	// ReplicaAnnounce makes kvlock CONFIG SET replica-announce-ip/-port
+	// on its kvrocks when forwarding is enabled (default true). Turn it
+	// off to keep values from the kvrocks config file.
+	ReplicaAnnounce bool
+	// ReplicaAnnounceIP/Port override the announced address. Defaults:
+	// $NOMAD_HOST_IP_<label>/$NOMAD_HOST_PORT_<label>, else the
+	// advertised address.
+	ReplicaAnnounceIP   string
+	ReplicaAnnouncePort int
 	// PeerExpose publishes this node's alloc index and address in its
 	// member key and exposes every peer at a stable loopback address,
 	// PeerBase with the last octet replaced by the peer's alloc index
@@ -258,6 +267,9 @@ func Parse(args []string) (*Config, error) {
 	fs.BoolVar(&c.ForwardEnabled, "forward", getenvBool("FORWARD_ENABLED", false), "Run the replication forwarder and point replicas at it ($FORWARD_ENABLED, default: off)")
 	fs.StringVar(&c.ForwardAddr, "forward-addr", getenv("FORWARD_ADDR", "127.0.1.1:18379"), "Forwarder listen address; replicas run REPLICAOF to it ($FORWARD_ADDR)")
 	fs.DurationVar(&c.ForwardHold, "forward-hold", getenvDur("FORWARD_HOLD", 5*time.Second), "How long a new forwarded connection waits for a known leader before it is closed ($FORWARD_HOLD)")
+	fs.BoolVar(&c.ReplicaAnnounce, "replica-announce", getenvBool("REPLICA_ANNOUNCE", true), "With --forward, set replica-announce-ip/-port on kvrocks ($REPLICA_ANNOUNCE, default: on)")
+	fs.StringVar(&c.ReplicaAnnounceIP, "replica-announce-ip", getenv("REPLICA_ANNOUNCE_IP", ""), "Announced replica IP (default: $NOMAD_HOST_IP_<label>, else advertise addr) ($REPLICA_ANNOUNCE_IP)")
+	fs.IntVar(&c.ReplicaAnnouncePort, "replica-announce-port", getenvInt("REPLICA_ANNOUNCE_PORT", 0), "Announced replica port (default: $NOMAD_HOST_PORT_<label>, else advertise port) ($REPLICA_ANNOUNCE_PORT)")
 	fs.BoolVar(&c.PeerExpose, "peer-expose", getenvBool("PEER_EXPOSE", false), "Expose each peer at <peer-base>.<alloc index>:<peer-port> and publish this node's alloc index ($PEER_EXPOSE, default: off)")
 	fs.StringVar(&c.PeerBase, "peer-base", getenv("PEER_BASE", "127.0.2.0"), "Loopback /24 for peer addresses; the last octet is the alloc index ($PEER_BASE)")
 	fs.IntVar(&c.PeerPort, "peer-port", getenvInt("PEER_PORT", 18379), "Port for peer addresses ($PEER_PORT)")
@@ -349,6 +361,31 @@ func Parse(args []string) (*Config, error) {
 	}
 	if c.AdvertiseAddr == "" {
 		c.AdvertiseAddr = c.KvrocksAddr
+	}
+	if c.ForwardEnabled && c.ReplicaAnnounce {
+		if c.AdvertiseNomadLabel != "" {
+			if c.ReplicaAnnounceIP == "" {
+				c.ReplicaAnnounceIP = os.Getenv("NOMAD_HOST_IP_" + c.AdvertiseNomadLabel)
+			}
+			if c.ReplicaAnnouncePort == 0 {
+				c.ReplicaAnnouncePort, _ = strconv.Atoi(os.Getenv("NOMAD_HOST_PORT_" + c.AdvertiseNomadLabel))
+			}
+		}
+		if c.ReplicaAnnounceIP == "" {
+			c.ReplicaAnnounceIP = c.AdvertiseAddr
+		}
+		if c.ReplicaAnnouncePort == 0 {
+			c.ReplicaAnnouncePort = c.AdvertisePort
+		}
+		if c.ReplicaAnnouncePort == 0 {
+			c.ReplicaAnnouncePort = c.KvrocksPort
+		}
+		if ip := net.ParseIP(c.ReplicaAnnounceIP); ip == nil {
+			return nil, fmt.Errorf("replica announce IP %q is not an IP (set --replica-announce-ip or --replica-announce=false)", c.ReplicaAnnounceIP)
+		}
+		if c.ReplicaAnnouncePort <= 0 || c.ReplicaAnnouncePort > 65535 {
+			return nil, fmt.Errorf("replica announce port %d invalid", c.ReplicaAnnouncePort)
+		}
 	}
 	if c.PeerExpose {
 		if c.AllocIndex < 0 || c.AllocIndex > 255 {

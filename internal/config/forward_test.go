@@ -64,3 +64,27 @@ func TestAdvertiseFromNomadLabel(t *testing.T) {
 		t.Fatal("unset label must fail")
 	}
 }
+
+func TestReplicaAnnounceDefaults(t *testing.T) {
+	t.Setenv("NOMAD_HOST_ADDR_kvrocks", "10.9.8.7:24567")
+	t.Setenv("NOMAD_HOST_IP_kvrocks", "10.9.8.7")
+	t.Setenv("NOMAD_HOST_PORT_kvrocks", "24567")
+	c, err := config.Parse([]string{"--advertise-nomad-label=kvrocks", "--forward"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ReplicaAnnounce || c.ReplicaAnnounceIP != "10.9.8.7" || c.ReplicaAnnouncePort != 24567 {
+		t.Fatalf("announce %v %s:%d", c.ReplicaAnnounce, c.ReplicaAnnounceIP, c.ReplicaAnnouncePort)
+	}
+	c, err = config.Parse([]string{"--advertise-nomad-label=kvrocks", "--forward", "--replica-announce-ip=10.1.1.1", "--replica-announce-port=1234"})
+	if err != nil || c.ReplicaAnnounceIP != "10.1.1.1" || c.ReplicaAnnouncePort != 1234 {
+		t.Fatalf("override: %v %+v", err, c)
+	}
+	c, err = config.Parse([]string{"--advertise-nomad-label=kvrocks", "--forward", "--replica-announce=false"})
+	if err != nil || c.ReplicaAnnounce {
+		t.Fatalf("off: %v", err)
+	}
+	if _, err := config.Parse([]string{"--forward", "--replica-announce-ip=kv02.example"}); err == nil {
+		t.Fatal("hostname announce must fail")
+	}
+}

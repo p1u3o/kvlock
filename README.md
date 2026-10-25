@@ -469,6 +469,13 @@ advertised address, which can be a Nomad dynamic port taken from
 - A connection that arrives during the gap is held for up to
   `--forward-hold` (default 5s).
 - The leader's own forwarder refuses connections.
+- kvlock sets `replica-announce-ip/-port` on its kvrocks (from
+  `NOMAD_HOST_IP_<label>`/`NOMAD_HOST_PORT_<label>` or
+  `--replica-announce-ip/-port`) before `REPLICAOF`, and re-applies it
+  after a kvrocks restart. `--replica-announce=false` disables it.
+- Defaults: forwarder `127.0.1.1:18379`, peers `127.0.2.<index>:18379`,
+  hold 5s, `--peer-expose` off (enable only once every node runs a
+  version that understands the JSON member format).
 
 `--peer-expose` gives each of N instances a stable address
 `127.0.2.<NOMAD_ALLOC_INDEX>:18379`. It is used for status and for the

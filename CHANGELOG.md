@@ -3,6 +3,10 @@
 ## v0.2.2 (unreleased)
 
 ### Added
+- With `--forward`, kvlock sets `replica-announce-ip`/`-port` on its
+  kvrocks (`--replica-announce`, `--replica-announce-ip`,
+  `--replica-announce-port`), before REPLICAOF and again after a kvrocks
+  restart.
 - Optional replication forwarder (`--forward`, `--forward-addr`,
   `--forward-hold`):
   - It listens on a fixed loopback address and forwards to the current

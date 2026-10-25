@@ -36,6 +36,8 @@ type Deps struct {
 
 // Controller owns runtime state.
 type Controller struct {
+	annOK   atomic.Bool  // replica-announce-* applied since kvrocks was last seen down
+	annAt   atomic.Int64 // unix nanos of the last announce check
 	roOK    atomic.Bool  // replica-read-only=yes confirmed since the last promotion
 	loopAt  atomic.Int64 // unix ms of the last completed tick (watchdog file)
 	obsMu   sync.Mutex
@@ -428,6 +430,7 @@ func (c *Controller) tick(ctx context.Context) {
 
 	c.mu.Lock()
 	if perr != nil {
+		c.annOK.Store(false) // a restarted kvrocks forgets CONFIG SET
 		c.kvUp = false
 		c.probed = true
 		c.unhealthy++
@@ -706,6 +709,11 @@ func (c *Controller) onFollow(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 		c.ensureReadOnly(rctx)
 		cancel()
 	}
+	if ri != nil && c.cfg.Mode != "observe" {
+		actx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+		c.ensureAnnounce(actx)
+		cancel()
+	}
 }
 
 // ensureReadOnly sets replica-read-only=yes. Only promote turns it off.
@@ -938,6 +946,7 @@ func (c *Controller) followLeader(ctx context.Context, lv *consulstore.LeaderVal
 	fctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
 	defer cancel()
 	c.ensureReadOnly(fctx)
+	c.ensureAnnounce(fctx)
 	if err := c.deps.KV.ReplicaOf(fctx, lv.Addr, lv.Port); err != nil {
 		if strings.Contains(err.Error(), "own replicas") {
 			// The new leader still lists us as its replica for a moment

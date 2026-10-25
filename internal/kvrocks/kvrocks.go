@@ -501,3 +501,41 @@ func IsReadOnlyError(err error) bool {
 	m := strings.ToLower(err.Error())
 	return strings.HasPrefix(m, "readonly") || strings.Contains(m, "read only") || strings.Contains(m, "read-only")
 }
+
+// SetReplicaAnnounce sets replica-announce-ip/-port, which a master uses
+// for this replica in its INFO slave list instead of the connection's
+// source address (needed when replicating through a forwarder).
+func (c *RedisClient) SetReplicaAnnounce(ctx context.Context, ip string, port int) error {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	if err := c.rdb.Do(ctx, "CONFIG", "SET", "replica-announce-ip", ip).Err(); err != nil {
+		return err
+	}
+	return c.rdb.Do(ctx, "CONFIG", "SET", "replica-announce-port", strconv.Itoa(port)).Err()
+}
+
+// ReplicaAnnounce reads replica-announce-ip/-port.
+func (c *RedisClient) ReplicaAnnounce(ctx context.Context) (string, int, error) {
+	ctx, cancel := c.ctx(ctx)
+	defer cancel()
+	get := func(k string) (string, error) {
+		v, err := c.rdb.Do(ctx, "CONFIG", "GET", k).StringSlice()
+		if err != nil {
+			return "", err
+		}
+		if len(v) < 2 {
+			return "", nil
+		}
+		return v[1], nil
+	}
+	ip, err := get("replica-announce-ip")
+	if err != nil {
+		return "", 0, err
+	}
+	ps, err := get("replica-announce-port")
+	if err != nil {
+		return "", 0, err
+	}
+	p, _ := strconv.Atoi(ps)
+	return ip, p, nil
+}

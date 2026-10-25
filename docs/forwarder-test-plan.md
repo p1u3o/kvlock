@@ -26,12 +26,34 @@ Clients that go through the leader proxy or the forwarder are unaffected.
 | B. Narrow range for kvrocks | e.g. TCP 18400–18409 | Small, auditable rule | Needs `client { min_dynamic_port/max_dynamic_port }`, which is node-wide, or static ports picked from that range per alloc |
 | C. Keep a static kvrocks port, forwarder only for stable addressing | TCP 8379 (as today) | No firewall change | Gives up the dynamic-port goal |
 
-**Recommendation: B.**
+**Recommendation: B, with static ports from 18400–18409.**
 
-- Reserve a small range for kvrocks, e.g. 18400–18409, with
-  `port "kvrocks" { static = <port in range> }` per group, or a
-  dedicated node class whose dynamic range is narrowed.
-- Open only that range in the NetBird policy, between the kv peer group.
+> **Needs Daniel's separate go.** The NetBird policy change below is not
+> part of this branch and must not be applied as part of the rollout
+> without explicit sign-off.
+
+How the job gets a port in that range — Nomad cannot limit a *dynamic*
+port to a range per job or per port label:
+
+- **Client `min_dynamic_port`/`max_dynamic_port`** (client config, e.g.
+  18400–18409). This is node-wide: every job on those hosts that asks for
+  a dynamic port then draws from those ten ports, so other jobs compete for
+  them (and fail to place when they run out). It also needs a client
+  restart. Only sensible on a dedicated kv node class. Not recommended.
+- **Static ports inside the range** (recommended):
+  `port "kvrocks" { static = 18400 }` in kvlock-test,
+  `static = 18401` in another job, and so on (one port per job; with
+  `count > 1` and one alloc per host, as the `distinct_hosts` constraint
+  already gives, the same static port on every host is fine). kvrocks
+  still reads `NOMAD_PORT_kvrocks`, kvlock still advertises through
+  `--advertise-nomad-label`, so moving to true dynamic ports later is a
+  jobspec-only change. Nomad reserves the port on the node, so a clash is
+  a placement error, not a silent bind failure.
+
+Firewall (once approved): allow TCP 18400–18409 in the NetBird policy
+**between the kv hosts' peer group only** (source and destination both
+the kv group), nothing from other groups.
+
 - 18379 (forwarder) and the 127.0.2.x peer addresses are loopback only,
   so they need no firewall rule.
 - Only fall back to A if you accept the larger surface.
@@ -39,18 +61,20 @@ Clients that go through the leader proxy or the forwarder are unaffected.
 ## 2. Switch kvlock-test to dynamic ports + forwarding
 
 1. kvrocks task:
-   - change `port "kvrocks" { static = 8379 }` to a dynamic port (or a
-     port in the narrow range);
+   - change `port "kvrocks" { static = 8379 }` to `static = 18400`
+     (section 1; needs the approved NetBird rule first);
    - make the config template set `port {{ env "NOMAD_PORT_kvrocks" }}`,
-     `replica-announce-ip {{ env "NOMAD_HOST_IP_kvrocks" }}` and
-     `replica-announce-port {{ env "NOMAD_HOST_PORT_kvrocks" }}`;
+     and optionally `replica-announce-ip {{ env "NOMAD_HOST_IP_kvrocks" }}` /
+     `replica-announce-port {{ env "NOMAD_HOST_PORT_kvrocks" }}` (kvlock
+     sets both itself with `--forward`; the log shows
+     "replica announce address set");
    - check that `bind` does **not** include 127.0.1.1.
 2. kvlock task, add:
    - `--kvrocks-port ${NOMAD_PORT_kvrocks}`
    - `--advertise-nomad-label kvrocks`, and drop the static
      `--advertise-port`
    - `--forward`, `--forward-addr 127.0.1.1:18379`, `--forward-hold 5s`
-   - optional: `--peer-expose`
+   - leave `--peer-expose` off until every node runs this version
 3. Leader proxy (if used by the loadtest or clients): keep it on 8379 on
    each host. It is a fixed port, so clients still use `host:8379`.
 4. `nomad job plan`, then `nomad job run`. Expect a rolling replacement:

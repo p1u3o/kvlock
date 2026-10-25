@@ -71,12 +71,20 @@ can also clash.
 
 Through the forwarder, the master sees every replica connecting from the
 leader host's own address. The replica's announced port is still its own.
-Set these on every kvrocks:
+So with `--forward` kvlock sets these on its local kvrocks itself
+(`CONFIG SET`), before the first `REPLICAOF`:
 
 ```
-replica-announce-ip   <real host IP, from NOMAD_HOST_ADDR_kvrocks>
-replica-announce-port <dynamic port, from NOMAD_HOST_PORT_kvrocks>
+replica-announce-ip   <--replica-announce-ip, else NOMAD_HOST_IP_<label>, else the advertise address>
+replica-announce-port <--replica-announce-port, else NOMAD_HOST_PORT_<label>, else the advertise/kvrocks port>
 ```
+
+`CONFIG SET` is not persisted, so kvlock re-applies it whenever it has
+seen kvrocks down (a restart), and re-checks it with `CONFIG GET` every
+30s while replicating. `--replica-announce=false` turns this off, e.g. to
+keep values from the kvrocks config file instead (the jobspec template
+below still sets them, as an override and for the window before kvlock
+starts).
 
 They keep the master's `INFO replication` slave list accurate. They also
 keep kvlock's "is this node one of the leader's replicas" check working.
@@ -134,6 +142,9 @@ forwarder address on every host to find the master.
 | `--forward-addr` | `FORWARD_ADDR` | `127.0.1.1:18379` | Listen address. Must be a loopback IP literal, and its port must differ from the kvrocks port |
 | `--forward-hold` | `FORWARD_HOLD` | `5s` | How long a new connection waits for a known leader. `0` refuses at once |
 | `--advertise-nomad-label` | `ADVERTISE_NOMAD_LABEL` | unset | Take the advertised addr:port from `$NOMAD_HOST_ADDR_<label>`. An explicit `--advertise-addr`/`--advertise-port` wins |
+| `--replica-announce` | `REPLICA_ANNOUNCE` | `true` | With `--forward`, `CONFIG SET replica-announce-ip/-port` on the local kvrocks |
+| `--replica-announce-ip` | `REPLICA_ANNOUNCE_IP` | `NOMAD_HOST_IP_<label>`, else advertise addr | Announced IP (an IP literal) |
+| `--replica-announce-port` | `REPLICA_ANNOUNCE_PORT` | `NOMAD_HOST_PORT_<label>`, else advertise port | Announced port |
 | `--peer-expose` | `PEER_EXPOSE` | `false` | Publish the alloc index and expose peers at stable addresses |
 | `--peer-base` | `PEER_BASE` | `127.0.2.0` | IPv4 loopback /24; the last octet is replaced by the index |
 | `--peer-port` | `PEER_PORT` | `18379` | Port for peer addresses. Must differ from the kvrocks port |
@@ -180,7 +191,8 @@ group "kv" {
       data = <<EOT
 bind 0.0.0.0
 port {{ env "NOMAD_PORT_kvrocks" }}
-# Accurate slave list through the forwarder:
+# Accurate slave list through the forwarder. kvlock also sets these
+# itself (--replica-announce, default on); kept here as an override:
 replica-announce-ip {{ env "NOMAD_HOST_IP_kvrocks" }}
 replica-announce-port {{ env "NOMAD_HOST_PORT_kvrocks" }}
 EOT
