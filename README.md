@@ -140,13 +140,15 @@ old leader never replicated are lost. Such a promotion logs an error
 `kvlock_promoted_despite_lag` to 1 and `/status` `promoted_despite_lag` to
 true for as long as that node stays leader. Alert on them.
 
-`--lag-gate-max-bytes` (default 4194304, 4MiB; 0 = off) is a hard cap on top
+`--lag-gate-max-bytes` (0 = off) is a hard cap on top
 of the gates above: a replica whose offset lag is over it never promotes, and
 `--lag-gate-max-wait` cannot force it; it waits until it has caught up to
 within the cap. At or under the cap the other gates still decide (the cap is
 necessary, not sufficient). The lag is the backend offset difference
-(`lag_bytes` in `/status`): bytes for Redis, but write sequence numbers for
-kvrocks, so for kvrocks the value counts writes, not bytes.
+(`lag_bytes` in `/status`) in the backend's offset units, so the default is
+backend-aware: 1000 for kvrocks (offsets are write sequence numbers, so this
+means 1000 writes) and 4194304 (4MiB) for Redis (offsets are bytes). The flag
+keeps its name for both; set it explicitly in the backend's unit.
 
 `/status` reports `promotable` (false on the leader and on a replica the gate
 would refuse now) and `promote_blocked` with the reason, e.g. lag over

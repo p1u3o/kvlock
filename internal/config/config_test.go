@@ -88,10 +88,17 @@ func TestLagGateDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.LagGateMaxWait != 0 || c.LagGateMaxBytes != 4<<20 {
-		t.Fatalf("defaults: max-wait %v max-bytes %d", c.LagGateMaxWait, c.LagGateMaxBytes)
+	if c.KVKind != "kvrocks" || c.LagGateMaxWait != 0 || c.LagGateMaxBytes != 1000 {
+		t.Fatalf("kvrocks defaults: kind %s max-wait %v max-bytes %d", c.KVKind, c.LagGateMaxWait, c.LagGateMaxBytes)
 	}
-	if _, err := config.Parse([]string{"--lag-gate-max-bytes=-1"}); err == nil {
-		t.Fatal("negative max bytes must fail")
+	r, err := config.Parse([]string{"--kv-kind=redis"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.LagGateMaxBytes != 4<<20 {
+		t.Fatalf("redis default max-bytes %d", r.LagGateMaxBytes)
+	}
+	if o, _ := config.Parse([]string{"--lag-gate-max-bytes=0"}); o == nil || o.LagGateMaxBytes != 0 {
+		t.Fatal("0 must turn the cap off")
 	}
 }

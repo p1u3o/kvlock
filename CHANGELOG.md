@@ -3,10 +3,10 @@
 ## v0.2.2 (unreleased)
 
 ### Added
-- `--lag-gate-max-bytes` (`$LAG_GATE_MAX_BYTES`, default 4MiB, 0 = off): a
-  replica whose offset lag is over it never promotes, even after
-  `--lag-gate-max-wait`. Offsets are bytes for Redis and write sequence
-  numbers for kvrocks.
+- `--lag-gate-max-bytes` (`$LAG_GATE_MAX_BYTES`, 0 = off): a replica whose
+  offset lag is over it never promotes, even after `--lag-gate-max-wait`. It
+  is in the backend's offset units, so the default is backend-aware: 1000
+  writes for kvrocks, 4MiB for Redis.
 - A promotion forced by `--lag-gate-max-wait` logs an error, adds a status
   event, increments `kvlock_promoted_despite_lag_total`, and sets the gauge
   `kvlock_promoted_despite_lag` and `/status` `promoted_despite_lag` while
