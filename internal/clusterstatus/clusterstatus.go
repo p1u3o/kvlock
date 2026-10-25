@@ -226,6 +226,7 @@ func WriteTable(w io.Writer, r Report, now time.Time) {
 		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n", name(n), role, s.Epoch, health, lag, bk, sess)
 	}
 	tw.Flush()
+	writeForwarders(w, r)
 	if r.Healthy {
 		fmt.Fprintf(w, "\ncluster healthy: leader %s, epoch %d\n", r.Leader, r.Epoch)
 	} else {
@@ -236,5 +237,39 @@ func WriteTable(w io.Writer, r Report, now time.Time) {
 	}
 	for _, x := range r.Warnings {
 		fmt.Fprintln(w, "  warning: "+x)
+	}
+}
+
+// writeForwarders lists each node's replication forwarder, if enabled.
+func writeForwarders(w io.Writer, r Report) {
+	first := true
+	for _, n := range r.Nodes {
+		if n.Status == nil || n.Status.Forwarder == nil {
+			continue
+		}
+		if first {
+			fmt.Fprintln(w, "\nforwarders:")
+			first = false
+		}
+		f := n.Status.Forwarder
+		target := f.Target
+		if target == "" {
+			target = "none (" + f.Reason + ")"
+		}
+		fmt.Fprintf(w, "  %s %s -> %s  active %d  total %d  resets %d  dropped %d  refused %d  bytes up/down %d/%d\n",
+			name(n), f.Listen, target, f.Active, f.Total, f.Resets, f.Dropped, f.Refused, f.BytesUp, f.BytesDown)
+	}
+	for _, n := range r.Nodes {
+		if n.Status == nil || len(n.Status.Peers) == 0 {
+			continue
+		}
+		fmt.Fprintf(w, "\npeer addresses on %s:\n", name(n))
+		for _, p := range n.Status.Peers {
+			target := p.Target
+			if target == "" {
+				target = "none (" + p.Reason + ")"
+			}
+			fmt.Fprintf(w, "  [%d] %s -> %s  active %d\n", p.Index, p.Listen, target, p.Active)
+		}
 	}
 }
