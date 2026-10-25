@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +23,27 @@ type Counters struct {
 	Active  func(delta float64)
 	Dropped func(n int)
 	Refused func()
+	// Reset is called when an established route is replaced or withdrawn
+	// (leader/epoch change).
+	Reset func()
+	// Accepted counts connections that reached an upstream.
+	Accepted func()
+	// Bytes counts forwarded bytes; dir is "up" (client to upstream) or
+	// "down". Called per write, so long-lived streams are visible.
+	Bytes func(dir string, n int)
+}
+
+// Stats is a point-in-time view of a proxy, for status pages.
+type Stats struct {
+	Target    string `json:"target"`
+	Reason    string `json:"reason,omitempty"`
+	Active    int64  `json:"active"`
+	Total     uint64 `json:"total"`
+	BytesUp   uint64 `json:"bytes_up"`
+	BytesDown uint64 `json:"bytes_down"`
+	Resets    uint64 `json:"resets"`
+	Dropped   uint64 `json:"dropped"`
+	Refused   uint64 `json:"refused"`
 }
 
 // Proxy forwards connections accepted on one listener.
@@ -31,8 +53,11 @@ type Proxy struct {
 	Notify      <-chan struct{} // optional: re-evaluate the route now
 	Poll        time.Duration   // re-evaluation interval (default 200ms)
 	DialTimeout time.Duration   // default 2s
-	Counters    Counters
-	Logf        func(msg string, fields map[string]any)
+	// Hold, when > 0, keeps a new connection waiting up to this long for
+	// a route instead of refusing it at once (e.g. during a failover).
+	Hold     time.Duration
+	Counters Counters
+	Logf     func(msg string, fields map[string]any)
 
 	mu     sync.Mutex
 	key    string
@@ -41,6 +66,19 @@ type Proxy struct {
 	closed bool
 	done   chan struct{}
 	once   sync.Once
+
+	target, reason                            string
+	active                                    atomic.Int64
+	total, up, down, resets, dropped, refused atomic.Uint64
+}
+
+// Stats returns counters and the current target.
+func (p *Proxy) Stats() Stats {
+	p.mu.Lock()
+	t, r := p.target, p.reason
+	p.mu.Unlock()
+	return Stats{Target: t, Reason: r, Active: p.active.Load(), Total: p.total.Load(), BytesUp: p.up.Load(), BytesDown: p.down.Load(),
+		Resets: p.resets.Load(), Dropped: p.dropped.Load(), Refused: p.refused.Load()}
 }
 
 type pair struct {
@@ -79,6 +117,15 @@ func (p *Proxy) init() {
 		}
 		if c.Refused == nil {
 			c.Refused = func() {}
+		}
+		if c.Reset == nil {
+			c.Reset = func() {}
+		}
+		if c.Accepted == nil {
+			c.Accepted = func() {}
+		}
+		if c.Bytes == nil {
+			c.Bytes = func(string, int) {}
 		}
 	})
 }
@@ -167,6 +214,7 @@ func (p *Proxy) sync() (addr, key, reason string) {
 		key = ""
 	}
 	p.mu.Lock()
+	p.target, p.reason = addr, reason
 	if key == p.key {
 		p.mu.Unlock()
 		return
@@ -178,7 +226,12 @@ func (p *Proxy) sync() (addr, key, reason string) {
 	for _, v := range victims {
 		v.close()
 	}
+	if old != "" {
+		p.resets.Add(1)
+		p.Counters.Reset()
+	}
 	if len(victims) > 0 {
+		p.dropped.Add(uint64(len(victims)))
 		p.Counters.Dropped(len(victims))
 	}
 	p.Logf("proxy route changed", map[string]any{"listener": p.Name, "target": addr, "reason": reason, "dropped": len(victims), "had_route": old != ""})
@@ -186,6 +239,7 @@ func (p *Proxy) sync() (addr, key, reason string) {
 }
 
 func (p *Proxy) refuse(c net.Conn, why string) {
+	p.refused.Add(1)
 	p.Counters.Refused()
 	p.Logf("proxy refused connection", map[string]any{"listener": p.Name, "client": c.RemoteAddr().String(), "reason": why})
 	c.Close()
@@ -193,6 +247,20 @@ func (p *Proxy) refuse(c net.Conn, why string) {
 
 func (p *Proxy) handle(c net.Conn) {
 	addr, key, reason := p.sync()
+	if addr == "" && p.Hold > 0 {
+		// Hold the client briefly: a failover usually resolves in well
+		// under Hold. Poll instead of subscribing; the cost is tiny.
+		deadline := time.Now().Add(p.Hold)
+		for addr == "" && time.Now().Before(deadline) {
+			select {
+			case <-p.done:
+				c.Close()
+				return
+			case <-time.After(25 * time.Millisecond):
+			}
+			addr, key, reason = p.sync()
+		}
+	}
 	if addr == "" {
 		p.refuse(c, reason)
 		return
@@ -207,25 +275,42 @@ func (p *Proxy) handle(c net.Conn) {
 	if p.closed || p.key != key {
 		p.mu.Unlock()
 		pr.close()
+		p.refused.Add(1)
 		p.Counters.Refused()
 		return
 	}
 	p.conns[pr] = struct{}{}
 	p.mu.Unlock()
+	p.total.Add(1)
+	p.Counters.Accepted()
+	p.active.Add(1)
 	p.Counters.Active(1)
-	defer p.Counters.Active(-1)
+	defer func() { p.active.Add(-1); p.Counters.Active(-1) }()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	cp := func(dst, src net.Conn) {
+	cp := func(dst, src net.Conn, dir string, ctr *atomic.Uint64) {
 		defer wg.Done()
-		_, _ = io.Copy(dst, src)
+		_, _ = io.Copy(&countWriter{w: dst, f: func(n int) { ctr.Add(uint64(n)); p.Counters.Bytes(dir, n) }}, src)
 		pr.close()
 	}
-	go cp(up, c)
-	go cp(c, up)
+	go cp(up, c, "up", &p.up)
+	go cp(c, up, "down", &p.down)
 	wg.Wait()
 	p.mu.Lock()
 	delete(p.conns, pr)
 	p.mu.Unlock()
+}
+
+type countWriter struct {
+	w io.Writer
+	f func(int)
+}
+
+func (c *countWriter) Write(b []byte) (int, error) {
+	n, err := c.w.Write(b)
+	if n > 0 {
+		c.f(n)
+	}
+	return n, err
 }
