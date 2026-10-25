@@ -3,6 +3,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -94,6 +95,33 @@ type Config struct {
 	// ProxyReadFallback is "leader" or "refuse" when the local replica
 	// is not usable.
 	ProxyReadFallback string
+	// ForwardEnabled turns on the replication forwarder: a local TCP
+	// listener at ForwardAddr that always forwards to the current leader,
+	// so replicas use one fixed REPLICAOF target (see docs/forwarder.md).
+	ForwardEnabled bool
+	// ForwardAddr is the forwarder listen address (IPv4 loopback literal
+	// plus port). Default 127.0.1.1:18379. Must not use the kvrocks port.
+	ForwardAddr string
+	// ForwardHold is how long a new forwarded connection waits for a
+	// leader before it is closed.
+	ForwardHold time.Duration
+	// AdvertiseNomadLabel reads the advertised address from
+	// NOMAD_HOST_ADDR_<label> (Nomad dynamic ports). Explicit
+	// --advertise-addr / --advertise-port still win.
+	AdvertiseNomadLabel string
+	// PeerExpose publishes this node's alloc index and address in its
+	// member key and exposes every peer at a stable loopback address,
+	// PeerBase with the last octet replaced by the peer's alloc index
+	// (e.g. 127.0.2.<index>:PeerPort). Used for status and for
+	// replication-offset probes before promotion.
+	PeerExpose bool
+	// PeerBase is the IPv4 loopback /24 for peer addresses.
+	PeerBase string
+	// PeerPort is the port every peer address listens on.
+	PeerPort int
+	// AllocIndex is this node's Nomad alloc index (NOMAD_ALLOC_INDEX);
+	// -1 when unknown.
+	AllocIndex int
 	// SentinelAddr enables the Sentinel-compatible listener (e.g. ":26379").
 	SentinelAddr string
 	// SentinelName is the master name clients ask for (default: cluster).
@@ -227,6 +255,14 @@ func Parse(args []string) (*Config, error) {
 	fs.StringVar(&c.ProxyAddr, "proxy-addr", getenv("PROXY_ADDR", ""), "Listen address for the TCP leader proxy, e.g. :6380 ($PROXY_ADDR, default: disabled)")
 	fs.StringVar(&c.ProxyReadAddr, "proxy-read-addr", getenv("PROXY_READ_ADDR", ""), "Listen address for the read proxy to the local replica, e.g. :6381 ($PROXY_READ_ADDR, default: disabled)")
 	fs.StringVar(&c.ProxyReadFallback, "proxy-read-fallback", getenv("PROXY_READ_FALLBACK", "leader"), "Read proxy when the local replica is unusable: leader or refuse ($PROXY_READ_FALLBACK)")
+	fs.BoolVar(&c.ForwardEnabled, "forward", getenvBool("FORWARD_ENABLED", false), "Run the replication forwarder and point replicas at it ($FORWARD_ENABLED, default: off)")
+	fs.StringVar(&c.ForwardAddr, "forward-addr", getenv("FORWARD_ADDR", "127.0.1.1:18379"), "Forwarder listen address; replicas run REPLICAOF to it ($FORWARD_ADDR)")
+	fs.DurationVar(&c.ForwardHold, "forward-hold", getenvDur("FORWARD_HOLD", 5*time.Second), "How long a new forwarded connection waits for a known leader before it is closed ($FORWARD_HOLD)")
+	fs.BoolVar(&c.PeerExpose, "peer-expose", getenvBool("PEER_EXPOSE", false), "Expose each peer at <peer-base>.<alloc index>:<peer-port> and publish this node's alloc index ($PEER_EXPOSE, default: off)")
+	fs.StringVar(&c.PeerBase, "peer-base", getenv("PEER_BASE", "127.0.2.0"), "Loopback /24 for peer addresses; the last octet is the alloc index ($PEER_BASE)")
+	fs.IntVar(&c.PeerPort, "peer-port", getenvInt("PEER_PORT", 18379), "Port for peer addresses ($PEER_PORT)")
+	fs.IntVar(&c.AllocIndex, "alloc-index", getenvInt("ALLOC_INDEX", getenvInt("NOMAD_ALLOC_INDEX", -1)), "This node's alloc index ($ALLOC_INDEX, else $NOMAD_ALLOC_INDEX)")
+	fs.StringVar(&c.AdvertiseNomadLabel, "advertise-nomad-label", getenv("ADVERTISE_NOMAD_LABEL", ""), "Take the advertised address from $NOMAD_HOST_ADDR_<label> (dynamic ports) ($ADVERTISE_NOMAD_LABEL)")
 	fs.StringVar(&c.SentinelAddr, "sentinel-addr", getenv("SENTINEL_ADDR", ""), "Listen address for the read-only Sentinel-compatible endpoint, e.g. :26379 ($SENTINEL_ADDR, default: disabled)")
 	fs.StringVar(&c.SentinelName, "sentinel-name", getenv("SENTINEL_NAME", ""), "Master name served on the Sentinel endpoint ($SENTINEL_NAME, default: --cluster)")
 	fs.BoolVar(&c.SentinelPrivate, "sentinel-private", getenvBool("SENTINEL_PRIVATE", false), "Announce private addresses on the Sentinel endpoint ($SENTINEL_PRIVATE)")
@@ -293,8 +329,56 @@ func Parse(args []string) (*Config, error) {
 	if c.WatchdogFile != "" && c.WatchdogInterval <= 0 {
 		return nil, fmt.Errorf("--watchdog-interval must be > 0")
 	}
+	if c.AdvertiseNomadLabel != "" {
+		env := "NOMAD_HOST_ADDR_" + c.AdvertiseNomadLabel
+		hp := os.Getenv(env)
+		if hp == "" {
+			return nil, fmt.Errorf("--advertise-nomad-label %q: $%s is not set", c.AdvertiseNomadLabel, env)
+		}
+		h, ps, err := net.SplitHostPort(hp)
+		port, perr := strconv.Atoi(ps)
+		if err != nil || perr != nil || h == "" || port <= 0 || port > 65535 {
+			return nil, fmt.Errorf("$%s=%q is not host:port", env, hp)
+		}
+		if c.AdvertiseAddr == "" {
+			c.AdvertiseAddr = h
+		}
+		if c.AdvertisePort == 0 {
+			c.AdvertisePort = port
+		}
+	}
 	if c.AdvertiseAddr == "" {
 		c.AdvertiseAddr = c.KvrocksAddr
+	}
+	if c.PeerExpose {
+		if c.AllocIndex < 0 || c.AllocIndex > 255 {
+			return nil, fmt.Errorf("--peer-expose needs an alloc index 0-255 (--alloc-index or $NOMAD_ALLOC_INDEX), got %d", c.AllocIndex)
+		}
+		if _, err := c.PeerAddr(0); err != nil {
+			return nil, err
+		}
+		if c.PeerPort <= 0 || c.PeerPort > 65535 || c.PeerPort == c.KvrocksPort {
+			return nil, fmt.Errorf("--peer-port %d must be a valid port other than the kvrocks port", c.PeerPort)
+		}
+	}
+	if c.ForwardEnabled {
+		h, p, err := c.ForwardHostPort()
+		if err != nil {
+			return nil, err
+		}
+		if p == c.KvrocksPort {
+			// kvrocks usually binds 0.0.0.0 in the shared network
+			// namespace, so the listener would clash, and REPLICAOF to its
+			// own port is refused by IsTryingToReplicateItself when the
+			// host is one of its bind/interface addresses.
+			return nil, fmt.Errorf("--forward-addr %s must not use the kvrocks port %d", c.ForwardAddr, p)
+		}
+		if ip := net.ParseIP(h); ip == nil || !ip.IsLoopback() {
+			return nil, fmt.Errorf("--forward-addr %s: host must be a loopback IP literal (e.g. 127.0.1.1)", c.ForwardAddr)
+		}
+		if c.ForwardHold < 0 {
+			return nil, fmt.Errorf("--forward-hold must be >= 0")
+		}
 	}
 	if c.ProxyReadFallback != "leader" && c.ProxyReadFallback != "refuse" {
 		return nil, fmt.Errorf("invalid --proxy-read-fallback %q (leader|refuse)", c.ProxyReadFallback)
@@ -495,4 +579,32 @@ func (b *Backup) RegisterStoreFlags(fs *flag.FlagSet) {
 	fs.StringVar(&b.SSE, "backup-s3-sse", getenv("KVLOCK_BACKUP_S3_SSE", "AES256"), "Server-side encryption to request: AES256|none ($KVLOCK_BACKUP_S3_SSE)")
 	fs.StringVar(&b.AccessKeyFile, "backup-s3-access-key-file", getenv("KVLOCK_BACKUP_S3_ACCESS_KEY_FILE", ""), "File with the S3 access key; or set $AWS_ACCESS_KEY_ID ($KVLOCK_BACKUP_S3_ACCESS_KEY_FILE)")
 	fs.StringVar(&b.SecretKeyFile, "backup-s3-secret-key-file", getenv("KVLOCK_BACKUP_S3_SECRET_KEY_FILE", ""), "File with the S3 secret key; or set $AWS_SECRET_ACCESS_KEY ($KVLOCK_BACKUP_S3_SECRET_KEY_FILE)")
+}
+
+// ForwardHostPort splits ForwardAddr.
+func (c *Config) ForwardHostPort() (string, int, error) {
+	h, ps, err := net.SplitHostPort(c.ForwardAddr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid --forward-addr %q: %w", c.ForwardAddr, err)
+	}
+	p, err := strconv.Atoi(ps)
+	if err != nil || p <= 0 || p > 65535 {
+		return "", 0, fmt.Errorf("invalid --forward-addr %q: bad port", c.ForwardAddr)
+	}
+	return h, p, nil
+}
+
+// PeerAddr is the stable local address for the peer with alloc index i:
+// PeerBase with its last octet set to i, on PeerPort.
+func (c *Config) PeerAddr(i int) (string, error) {
+	ip := net.ParseIP(c.PeerBase).To4()
+	if ip == nil || !ip.IsLoopback() {
+		return "", fmt.Errorf("--peer-base %q must be an IPv4 loopback address", c.PeerBase)
+	}
+	if i < 0 || i > 255 {
+		return "", fmt.Errorf("alloc index %d out of range 0-255", i)
+	}
+	ip = append(net.IP(nil), ip...)
+	ip[3] = byte(i)
+	return net.JoinHostPort(ip.String(), strconv.Itoa(c.PeerPort)), nil
 }

@@ -56,6 +56,9 @@ type Registry struct {
 	ProxyActive    *prometheus.GaugeVec   // listener
 	ProxyDropped   *prometheus.CounterVec // listener
 	ProxyRefused   *prometheus.CounterVec // listener
+	ProxyAccepted  *prometheus.CounterVec // listener
+	ProxyResets    *prometheus.CounterVec // listener
+	ProxyBytes     *prometheus.CounterVec // listener, direction
 
 	// Backups (all zero while backups are disabled).
 	BackupLastSuccess prometheus.Gauge
@@ -94,6 +97,9 @@ func New() *Registry {
 	r.Handovers = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "handovers_total", Help: "Planned handover requests, by result."}, []string{"result"})
 	r.ProxyActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: Namespace, Name: "proxy_active_connections", Help: "Currently proxied client connections, by listener (write|read)."}, []string{"listener"})
 	r.ProxyDropped = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "proxy_dropped_connections_total", Help: "Proxied connections closed because the routing target changed (failover, fencing, lost Consul confirmation)."}, []string{"listener"})
+	r.ProxyResets = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "proxy_route_resets_total", Help: "Times an established route was replaced or withdrawn (leader, epoch or fencing change), cutting all connections."}, []string{"listener"})
+	r.ProxyAccepted = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "proxy_connections_total", Help: "Connections forwarded to an upstream, by listener (write|read|forward)."}, []string{"listener"})
+	r.ProxyBytes = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "proxy_bytes_total", Help: "Bytes forwarded, by listener and direction (up = client to upstream)."}, []string{"listener", "direction"})
 	r.ProxyRefused = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "proxy_refused_connections_total", Help: "Connections refused because no safe target was known or the dial failed."}, []string{"listener"})
 
 	r.BackupLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "backup_last_success_timestamp_seconds", Help: "Unix time of this node's last successful backup upload; 0 never."})
@@ -109,7 +115,7 @@ func New() *Registry {
 		func() float64 { return call(&r.lockHeld, 0) })
 
 	r.prom.MustRegister(r.IsLeader, r.BackendUp, r.ReplicationLag, r.Elections, r.LeaderAcquired, r.LeaderChanges,
-		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, r.ProxyActive, r.ProxyDropped, r.ProxyRefused, renew, held,
+		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, r.ProxyActive, r.ProxyDropped, r.ProxyRefused, r.ProxyAccepted, r.ProxyBytes, r.ProxyResets, renew, held,
 		r.LagSeconds, r.HeartbeatAge, r.Heartbeats, r.LagRefusals,
 		r.BackupLastSuccess, r.BackupLastSize, r.BackupDuration, r.BackupFailures, r.WatchdogWrites,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))

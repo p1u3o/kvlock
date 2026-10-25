@@ -69,6 +69,7 @@ type Controller struct {
 	// replicated from a new leader. rejoinSince bounds that wait.
 	rejoin      bool
 	rejoinSince time.Time
+	peers       peerTable
 	memberSID   string // session our member key was last acquired with
 	// lastRenewOK is the last time Consul confirmed our session (create or
 	// renew). The leader tolerates Consul errors until ~SessionTTL past it.
@@ -95,7 +96,10 @@ type Controller struct {
 	infoMu  sync.RWMutex
 	version string
 	conns   func() map[string]int
-	admin   bool
+	// fwdStats reports the replication forwarder (nil when disabled).
+	fwdStats  func() *httpapi.Forwarder
+	peerStats func() []httpapi.Peer
+	admin     bool
 
 	rng *rand.Rand
 
@@ -193,12 +197,34 @@ func (c *Controller) Snapshot() httpapi.Snapshot {
 	c.infoMu.RLock()
 	s.Version, s.AdminEnabled = c.version, c.admin
 	conns := c.conns
+	fwd := c.fwdStats
+	ps := c.peerStats
 	c.infoMu.RUnlock()
 	if conns != nil {
 		s.Connections = conns()
 	}
+	if fwd != nil {
+		s.Forwarder = fwd()
+	}
+	if ps != nil {
+		s.Peers = ps()
+	}
 	s.Events = c.Events()
 	return s
+}
+
+// SetPeers registers the peer listener stats source for /status.
+func (c *Controller) SetPeers(f func() []httpapi.Peer) {
+	c.infoMu.Lock()
+	c.peerStats = f
+	c.infoMu.Unlock()
+}
+
+// SetForwarder registers the forwarder stats source for /status.
+func (c *Controller) SetForwarder(f func() *httpapi.Forwarder) {
+	c.infoMu.Lock()
+	c.fwdStats = f
+	c.infoMu.Unlock()
 }
 
 // SetInfo sets what the status page shows besides controller state.
@@ -484,7 +510,8 @@ func (c *Controller) sampleLeader(ctx context.Context, holder string, target *co
 	}
 	pctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
 	defer cancel()
-	pi, err := c.deps.KV.PeerInfoReplication(pctx, target.Addr, target.Port)
+	ph, pp := c.probeAddr(target)
+	pi, err := c.deps.KV.PeerInfoReplication(pctx, ph, pp)
 	if err != nil {
 		c.log.Warn("could not sample leader replication offset", map[string]any{"error": err.Error(), "leader": target.Node})
 		return
@@ -516,7 +543,8 @@ func (c *Controller) resampleOld(ctx context.Context, old *consulstore.LeaderVal
 	}
 	pctx, cancel := context.WithTimeout(ctx, minDur(c.cfg.KvrocksTimeout, time.Second))
 	defer cancel()
-	pi, err := c.deps.KV.PeerInfoReplication(pctx, target.Addr, target.Port)
+	ph, pp := c.probeAddr(target)
+	pi, err := c.deps.KV.PeerInfoReplication(pctx, ph, pp)
 	if err != nil || pi.Role != "master" || pi.MasterOffset < 0 {
 		return
 	}
@@ -662,11 +690,15 @@ func (c *Controller) onFollow(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 		}
 		return
 	}
-	if ri != nil && ri.Role == "slave" && ri.MasterHost == target.Addr && ri.MasterPort == target.Port && ri.MasterLinkUp {
+	// With the forwarder on, the replica always points at the local
+	// forwarder; leader changes are handled by the forwarder cutting its
+	// connections, not by a new REPLICAOF.
+	rt := c.replTarget(target)
+	if ri != nil && ri.Role == "slave" && ri.MasterHost == rt.Addr && ri.MasterPort == rt.Port && ri.MasterLinkUp {
 		c.clearRejoin(lv)
 	}
-	if ri != nil && !(ri.Role == "slave" && ri.MasterHost == target.Addr && ri.MasterPort == target.Port) {
-		c.followLeader(ctx, target)
+	if ri != nil && !(ri.Role == "slave" && ri.MasterHost == rt.Addr && ri.MasterPort == rt.Port) {
+		c.followLeader(ctx, rt)
 	} else if ri != nil && c.cfg.Mode != "observe" && !c.roOK.Load() {
 		// Already a replica (e.g. after a sidecar restart): make sure it
 		// is read-only once per process / after each promotion.
@@ -701,6 +733,22 @@ func (c *Controller) followTarget(lv *consulstore.LeaderValue) *consulstore.Lead
 		return nil
 	}
 	return &t
+}
+
+// replTarget maps a follow target to what REPLICAOF should use: the
+// local forwarder when it is enabled, else the leader itself. The node
+// name, session and epoch are kept for logging. nil stays nil.
+func (c *Controller) replTarget(t *consulstore.LeaderValue) *consulstore.LeaderValue {
+	if t == nil || !c.cfg.ForwardEnabled {
+		return t
+	}
+	h, p, err := c.cfg.ForwardHostPort()
+	if err != nil { // validated in config.Parse
+		return t
+	}
+	r := *t
+	r.Addr, r.PrivateAddr, r.Port = h, "", p
+	return &r
 }
 
 // isFenced reports whether the local instance already refuses writes:
@@ -931,7 +979,7 @@ func (c *Controller) demote(ctx context.Context, label, reason string, target *c
 	defer cancel()
 	_ = c.deps.Registrar.FailTTL(dctx, c.deps.Registrar.CheckID(c.serviceID()))
 	_ = c.deps.Registrar.Deregister(dctx, c.serviceID())
-	if c.fence(ctx, c.followTarget(target)) {
+	if c.fence(ctx, c.replTarget(c.followTarget(target))) {
 		c.killClients(ctx)
 	}
 	c.setRole(elect.RoleFollower)

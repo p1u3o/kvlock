@@ -101,7 +101,7 @@ func (c *Controller) publishMember(ctx context.Context, sid string) {
 	if done {
 		return
 	}
-	ok, err := c.deps.Lock.Acquire(ctx, c.cfg.MembersPrefix()+c.cfg.NodeName, sid, []byte(c.cfg.NodeName))
+	ok, err := c.deps.Lock.Acquire(ctx, c.cfg.MembersPrefix()+c.cfg.NodeName, sid, c.memberValue())
 	if err != nil || !ok {
 		return
 	}
@@ -118,8 +118,8 @@ func (c *Controller) livePeer(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		for _, m := range ms {
-			if m != "" && m != c.cfg.NodeName {
+		for _, v := range ms {
+			if m := ParseMember(v).Node; m != "" && m != c.cfg.NodeName {
 				return m, nil
 			}
 		}

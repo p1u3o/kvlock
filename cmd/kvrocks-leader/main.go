@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"github.com/p1u3o/kvlock/internal/backup"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -111,7 +113,7 @@ func main() {
 		}()
 	}
 
-	var proxies []*proxy.Proxy
+	var proxies []io.Closer
 	for _, pc := range []struct {
 		name, addr string
 		route      proxy.Route
@@ -128,6 +130,36 @@ func main() {
 			os.Exit(1)
 		}
 		proxies = append(proxies, p)
+	}
+
+	if cfg.ForwardEnabled {
+		p, err := startProxyHold("forward", cfg.ForwardAddr, forwardRoute(c), c.Subscribe(), cfg.ForwardHold, reg, log)
+		if err != nil {
+			log.Error("forwarder listener failed", map[string]any{"addr": cfg.ForwardAddr, "error": err.Error()})
+			os.Exit(1)
+		}
+		proxies = append(proxies, p)
+		listen := cfg.ForwardAddr
+		c.SetForwarder(func() *httpapi.Forwarder {
+			st := p.Stats()
+			return &httpapi.Forwarder{Listen: listen, Target: st.Target, Reason: st.Reason, Active: st.Active, Total: st.Total,
+				BytesUp: st.BytesUp, BytesDown: st.BytesDown, Resets: st.Resets, Dropped: st.Dropped, Refused: st.Refused}
+		})
+	}
+
+	if cfg.PeerExpose {
+		pl := newPeerListeners(c, cfg.PeerAddr, reg, log)
+		go pl.run(ctx, cfg.CheckInterval)
+		proxies = append(proxies, pl)
+		c.SetPeers(func() []httpapi.Peer {
+			var out []httpapi.Peer
+			for i, st := range pl.stats() {
+				a, _ := cfg.PeerAddr(i)
+				out = append(out, httpapi.Peer{Index: i, Listen: a, Target: st.Target, Reason: st.Reason, Active: st.Active})
+			}
+			sort.Slice(out, func(a, b int) bool { return out[a].Index < out[b].Index })
+			return out
+		})
 	}
 
 	// SIGTERM: deregister, fence the local instance, then release the lock.

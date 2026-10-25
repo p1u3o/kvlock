@@ -92,3 +92,36 @@ func (c *Controller) ProxyView() ProxyView {
 	}
 	return v
 }
+
+// ForwardView is the replication forwarder's routing decision: the real
+// address of the current lock holder, or "" (refuse/hold) when this node
+// is the leader, the leader is unknown, or Consul has not confirmed it
+// recently. The key includes session and epoch, so any leadership change
+// cuts every forwarded connection, even if the address is reused.
+func (c *Controller) ForwardView() (addr, key, reason string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	grace := 2 * c.cfg.CheckInterval
+	if grace < time.Second {
+		grace = time.Second
+	}
+	lv := c.leader
+	switch {
+	case lv == nil:
+		return "", "", "leader unknown"
+	case c.lastConsulOK.IsZero() || time.Since(c.lastConsulOK) >= grace:
+		return "", "", "leadership state not confirmed with Consul"
+	case lv.Node == c.cfg.NodeName || (lv.Session != "" && lv.Session == c.sessionID) || c.role == elect.RoleLeader:
+		// The leader never replicates; forwarding to itself would loop.
+		return "", "", "this node is the leader"
+	}
+	host := lv.Addr
+	if lv.PrivateAddr != "" {
+		host = lv.PrivateAddr
+	}
+	if host == "" || lv.Port == 0 {
+		return "", "", "leader address unknown"
+	}
+	addr = net.JoinHostPort(host, strconv.Itoa(lv.Port))
+	return addr, addr + "|" + lv.Session + "|" + strconv.FormatUint(lv.Epoch, 10), "forwarding to leader " + lv.Node
+}

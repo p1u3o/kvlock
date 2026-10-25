@@ -55,9 +55,27 @@ type Snapshot struct {
 	FenceState          string         `json:"fence_state"`
 	FencePending        bool           `json:"fence_pending"`
 	Connections         map[string]int `json:"connections,omitempty"`
-	Events              []Event        `json:"events"`
+	// Forwarder is nil unless the replication forwarder is enabled.
+	Forwarder *Forwarder `json:"forwarder,omitempty"`
+	// Peers lists stable peer addresses when peer exposure is enabled.
+	Peers  []Peer  `json:"peers,omitempty"`
+	Events []Event `json:"events"`
 	// AdminEnabled tells the page whether POST /handover exists.
 	AdminEnabled bool `json:"admin_enabled"`
+}
+
+// Forwarder describes the replication forwarder.
+type Forwarder struct {
+	Listen    string `json:"listen"`
+	Target    string `json:"target"`
+	Reason    string `json:"reason,omitempty"`
+	Active    int64  `json:"active"`
+	Total     uint64 `json:"total"`
+	BytesUp   uint64 `json:"bytes_up"`
+	BytesDown uint64 `json:"bytes_down"`
+	Resets    uint64 `json:"resets"`
+	Dropped   uint64 `json:"dropped"`
+	Refused   uint64 `json:"refused"`
 }
 
 // Event is one entry of the recent-events ring buffer.
@@ -105,4 +123,13 @@ func Handler(p Provider, admin ...Admin) http.Handler {
 		ui.ServeHTTP(w, r)
 	})
 	return mux
+}
+
+// Peer is one stable peer address (peer exposure).
+type Peer struct {
+	Index  int    `json:"index"`
+	Listen string `json:"listen"`
+	Target string `json:"target,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	Active int64  `json:"active"`
 }
