@@ -71,3 +71,26 @@ func TestProxyViewFailsClosedWithoutConsul(t *testing.T) {
 		t.Fatalf("no Consul contact yet must mean no route: %+v", v)
 	}
 }
+
+// On a replica the key follows only the remote leader (session, epoch):
+// the local instance being fenced or re-pointed must not cut clients.
+func TestProxyViewKeyIgnoresLocalFenceOnReplica(t *testing.T) {
+	cfg := testConfig("kv01")
+	kv := &fakeKV{up: true, role: "slave", masterHost: "10.0.0.2", masterPort: 6666, local: 10}
+	lock := &fakeLock{val: elect.MarshalLeader("kv02", "10.0.0.2", "", 6666, "sess-other", 9, time.Now()), sess: "sess-other"}
+	c, stop := startCtl(t, cfg, controller.Deps{Session: &fakeSession{}, Lock: lock, Registrar: &fakeRegistrar{}, KV: kv})
+	defer stop()
+	time.Sleep(100 * time.Millisecond)
+	before := c.ProxyView()
+	if before.Key == "" {
+		t.Fatalf("setup: no route: %+v", before)
+	}
+	// The local kvrocks restarts as a master; the sidecar fences it.
+	kv.mu.Lock()
+	kv.role, kv.masterHost, kv.masterPort = "master", "", 0
+	kv.mu.Unlock()
+	time.Sleep(150 * time.Millisecond)
+	if after := c.ProxyView(); after.Key != before.Key {
+		t.Fatalf("local fence changed the route key: before=%q after=%q", before.Key, after.Key)
+	}
+}

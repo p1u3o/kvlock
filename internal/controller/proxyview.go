@@ -179,7 +179,15 @@ func (c *Controller) ProxyView() ProxyView {
 	}
 	if v.Leader != "" {
 		v.State = RouteOK
-		v.Key = v.Leader + "|" + lv.Session + "|" + string(c.role) + "|" + strconv.FormatUint(c.fenceGen.Load(), 10)
+		// Connections are cut only on a leader or epoch change. On the
+		// leader itself the key also carries role and fence generation,
+		// so a local demotion or fence still cuts at once; on a replica
+		// its own fencing or replica topology changes do not touch
+		// connections to the remote leader.
+		v.Key = v.Leader + "|" + lv.Session + "|" + strconv.FormatUint(lv.Epoch, 10)
+		if self {
+			v.Key += "|" + string(c.role) + "|" + strconv.FormatUint(c.fenceGen.Load(), 10)
+		}
 	}
 	return v
 }
