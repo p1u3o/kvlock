@@ -139,7 +139,7 @@ type presenceLock struct {
 }
 
 func (p *presenceLock) Acquire(ctx context.Context, key, sess string, v []byte) (bool, error) {
-	if strings.Contains(key, "/members/") {
+	if strings.Contains(key, "/members/") || strings.Contains(key, "/offsets/") {
 		p.pmu.Lock()
 		defer p.pmu.Unlock()
 		p.members[key] = string(v)

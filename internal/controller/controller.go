@@ -56,6 +56,9 @@ type Controller struct {
 	sessionID     string
 	sessionValid  bool
 	unhealthy     int
+	slowStreak    int // consecutive health probes that timed out
+	offsetBestAt  time.Time
+	offsetBest    string // reason from the last winning offset comparison
 	leaderSince   time.Time
 	elections     uint64
 	leaderChanges uint64
@@ -444,22 +447,42 @@ func (c *Controller) isLeader() bool {
 
 // tick: health check, then election step.
 func (c *Controller) tick(ctx context.Context) {
-	// 1. Health: PING + INFO with timeout.
-	hctx, cancel := context.WithTimeout(ctx, c.cfg.KvrocksTimeout)
+	// 1. Health: PING + INFO with timeout. A probe that times out is
+	// "slow", not "dead": a kvrocks busy with heavy writes or a replica
+	// sync answers late. Slow probes keep the last known state until
+	// SlowThreshold of them in a row; anything else (refused, reset,
+	// error) counts toward UnhealthyThreshold as before.
+	hctx, cancel := context.WithTimeout(ctx, c.healthTimeout())
 	ri, perr := c.probe(hctx)
 	cancel()
+	slow := perr != nil && kvrocks.IsTimeout(perr)
 
 	c.mu.Lock()
+	if slow {
+		c.slowStreak++
+		if c.slowStreak < c.slowThreshold() {
+			streak := c.slowStreak
+			c.mu.Unlock()
+			c.reg.SlowProbes.Inc()
+			c.log.Warn("kvrocks health probe slow; keeping state", map[string]any{"slow_streak": streak, "threshold": c.slowThreshold(), "error": perr.Error()})
+			return
+		}
+	}
 	if perr != nil {
 		c.annOK.Store(false) // a restarted kvrocks forgets CONFIG SET
 		c.kvUp = false
 		c.probed = true
 		c.unhealthy++
+		if slow && c.unhealthy < c.cfg.UnhealthyThreshold {
+			// Slow for SlowThreshold probes in a row: treat as down now.
+			c.unhealthy = c.cfg.UnhealthyThreshold
+		}
 		c.backendRole = ""
 	} else {
 		c.kvUp = true
 		c.probed = true
 		c.unhealthy = 0
+		c.slowStreak = 0
 		c.backendRole = ri.Role
 		c.lastRI = ri
 	}
@@ -655,6 +678,22 @@ func (c *Controller) evaluate(ctx context.Context, ri *kvrocks.ReplicationInfo, 
 	}
 }
 
+func (c *Controller) healthTimeout() time.Duration {
+	if c.cfg.HealthTimeout > 0 {
+		return c.cfg.HealthTimeout
+	}
+	return c.cfg.KvrocksTimeout
+}
+
+// slowThreshold is how many slow probes in a row count as down. Unset
+// (0) keeps the old behaviour: slow counts like any failure.
+func (c *Controller) slowThreshold() int {
+	if c.cfg.SlowThreshold > 0 {
+		return c.cfg.SlowThreshold
+	}
+	return 1
+}
+
 func (c *Controller) probe(ctx context.Context) (*kvrocks.ReplicationInfo, error) {
 	if err := c.deps.KV.Ping(ctx); err != nil {
 		return nil, err
@@ -796,8 +835,16 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		c.observeLog("not running for leader: local instance replicates from a live master", map[string]any{"master_host": ri.MasterHost, "master_port": ri.MasterPort})
 		return
 	}
-	if c.deferToPeer(ctx, ri) {
+	// With no leader, compare published replication offsets with every
+	// live peer: the most up-to-date live node may promote even if it is
+	// a restarted former leader or its lag behind the old leader is
+	// unknown. It never wins while any live node is ahead.
+	od := c.offsetDecision(ctx, ri, oldMaster)
+	if !od.Allow && c.deferToPeer(ctx, ri) {
 		return
+	}
+	if od.Allow {
+		c.observeLog("offset comparison: "+od.Reason, nil)
 	}
 	// Flapping guard: backoff with jitter between attempts.
 	c.mu.RLock()
@@ -854,6 +901,12 @@ func (c *Controller) tryBecomeLeader(ctx context.Context, raw []byte, ri *kvrock
 		}
 	}
 	dec := elect.LagGate(in)
+	if !dec.Allow && od.Allow {
+		// The old leader, if another node, is live and not ahead of us
+		// (OffsetElect requires its fresh offset), so nothing is lost.
+		c.event("offset_elect", "lag gate overridden: "+od.Reason+" (lag gate said: "+dec.Reason+")")
+		dec = od
+	}
 	lag = in.Lag
 	if !dec.Allow {
 		c.reg.LagRefusals.Inc()
@@ -1432,6 +1485,9 @@ func (c *Controller) promoteBlockedLocked() string {
 	case !c.hb.havePeer && c.lag > c.cfg.MaxLagBytes:
 		return fmt.Sprintf("lag %d over max-lag %d", c.lag, c.cfg.MaxLagBytes)
 	case c.lag < 0 && !(c.hb.havePeer && c.hb.lag >= 0):
+		if !c.offsetBestAt.IsZero() && time.Since(c.offsetBestAt) < c.offsetFresh() {
+			return ""
+		}
 		return "lag unknown"
 	}
 	return ""

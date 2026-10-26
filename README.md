@@ -9,9 +9,13 @@ Each sidecar runs next to its local kvrocks and loops every
 `--check-interval` (default 3s):
 
 1. **Health**: `PING` + `INFO replication` against local kvrocks (timeout
-   `--kvrocks-timeout`, default 2s). After `--unhealthy-threshold`
-   (default 3) consecutive failures the sidecar stops renewing its Consul
-   session and releases the lock.
+   `--health-timeout`, default 5s). A probe that **times out** counts as
+   slow, not dead: the node keeps its state (and its leadership) until
+   `--unhealthy-slow-threshold` (default 4) slow probes in a row, then it
+   counts as down. Any other failure (connection refused or reset, an
+   error reply) counts toward `--unhealthy-threshold` (default 3). Once
+   down, the sidecar stops renewing its Consul session and releases the
+   lock. Slow probes increment `kvlock_health_probe_slow_total`.
 2. **Session**: Consul session with **no node health checks** (only the
    TTL), TTL `--session-ttl` (default 10s), `behavior=release`,
    `LockDelay` `--lock-delay` (default 1s). Renewed at TTL/3 while kvrocks
@@ -150,6 +154,30 @@ backend-aware: 1000 for kvrocks (offsets are write sequence numbers, so this
 means 1000 writes) and 4194304 (4MiB) for Redis (offsets are bytes). The flag
 keeps its name for both; set it explicitly in the backend's unit.
 
+### Offset election (no leader)
+
+While nobody holds the lock, every sidecar publishes its local replication
+offset at `kvrocks/<cluster>/offsets/<node>`, held by its own session (so
+the key disappears with the sidecar), and compares it with the offsets of
+every live peer it knows about (member keys plus passing catalog
+instances). A node may promote, even if it is a restarted former leader
+deferring to a peer or its lag behind the old leader is unknown, when:
+
+- every known live peer has published an offset in the last
+  max(5 x `--check-interval`, 2s);
+- if the last leader was another node, that node is one of them (a dead
+  old leader may hold writes nobody else has, so the lag gate and
+  hold-down still apply);
+- no peer is ahead; ties go to the lowest node name.
+
+Every node looking at the same entries picks the same winner, and a node
+behind any live node never wins. This is what ends the rejoin deadlock where
+the restarted former leader (newest data) defers to a peer that the lag gate
+refuses. Disable with `--offset-elect=false` (`$OFFSET_ELECT`). The Consul
+token needs write on `kvrocks/<cluster>/offsets/` (covered by a policy on
+`kvrocks/<cluster>/`). Results count in `kvlock_offset_elections_total`
+(`result` = allow|deny).
+
 `/status` reports `promotable` (false on the leader and on a replica the gate
 would refuse now) and `promote_blocked` with the reason, e.g. lag over
 `--lag-gate-max-bytes`, `--max-lag-time` or `--max-lag`. It does not model the
@@ -253,6 +281,8 @@ alerts by adding the prefix. Go/process collector names are unchanged.
 | `kvlock_heartbeat_age_seconds` | gauge (-1 = none) | local clock minus newest local heartbeat (includes clock skew) |
 | `kvlock_heartbeat_writes_total` | counter | `result` = ok\|error |
 | `kvlock_lag_gate_refusals_total` | counter | |
+| `kvlock_health_probe_slow_total` | counter | health probes that timed out while under `--unhealthy-slow-threshold` |
+| `kvlock_offset_elections_total` | counter | `result` = allow\|deny |
 | `kvlock_lock_held_seconds`, `kvlock_consul_last_renew_age_seconds` | gauge | |
 | `kvlock_elections_total`, `kvlock_leader_acquired_total`, `kvlock_leader_changes_total` | counter | |
 | `kvlock_step_downs_total` | counter | `reason` = backend_unhealthy, session_invalidated, consul_unreachable, lock_lost, lock_taken, handover, shutdown |
@@ -462,7 +492,10 @@ to).
 It fails closed:
 
 - all proxied connections are closed immediately on any change of lock
-  holder, of this node's role, or when this node fences its instance;
+  holder (session) or epoch; on the leader itself also on a change of its
+  role or when it fences its instance. On a replica, fencing or
+  re-pointing the local instance and replica topology changes do not cut
+  connections to the remote leader;
 - new connections are refused (accepted and closed) while the leader is
   unknown, the local leader is not yet a writable master, or Consul has not
   answered within two check intervals (the leader's TTL grace window), and

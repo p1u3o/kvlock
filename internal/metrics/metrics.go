@@ -34,9 +34,11 @@ const Namespace = "kvlock"
 type Registry struct {
 	prom *prometheus.Registry
 
-	IsLeader       prometheus.Gauge
-	BackendUp      prometheus.Gauge
-	ReplicationLag prometheus.Gauge
+	IsLeader        prometheus.Gauge
+	BackendUp       prometheus.Gauge
+	SlowProbes      prometheus.Counter
+	OffsetElections *prometheus.CounterVec
+	ReplicationLag  prometheus.Gauge
 	// LagSeconds is the heartbeat-based lag behind the leader.
 	LagSeconds prometheus.Gauge
 	// HeartbeatAge is now minus the newest heartbeat in the local instance.
@@ -85,6 +87,8 @@ func New() *Registry {
 	r := &Registry{prom: prometheus.NewRegistry()}
 	r.IsLeader = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "is_leader", Help: "1 while this sidecar holds the leader lock."})
 	r.BackendUp = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "kvrocks_up", Help: "1 while the local backend answers PING and INFO."})
+	r.SlowProbes = prometheus.NewCounter(prometheus.CounterOpts{Namespace: Namespace, Name: "health_probe_slow_total", Help: "Health probes of the local backend that timed out but stayed under --unhealthy-slow-threshold (state kept)."})
+	r.OffsetElections = prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: Namespace, Name: "offset_elections_total", Help: "Leaderless offset comparisons, by result (allow, deny)."}, []string{"result"})
 	r.ReplicationLag = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "replication_lag_bytes", Help: "Lag behind the leader (kvrocks: sequence numbers, Redis: bytes); -1 unknown, 0 on the leader."})
 	r.LagSeconds = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "replication_lag_seconds", Help: "Heartbeat lag behind the leader in seconds (leader heartbeat minus the heartbeat replicated locally); -1 unknown, 0 on the leader."})
 	r.HeartbeatAge = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: Namespace, Name: "heartbeat_age_seconds", Help: "Local clock minus the newest heartbeat in the local instance (includes clock skew); -1 unknown."})
@@ -120,7 +124,7 @@ func New() *Registry {
 	held := prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: Namespace, Name: "lock_held_seconds", Help: "Seconds this node has held the leader lock; 0 when not leader."},
 		func() float64 { return call(&r.lockHeld, 0) })
 
-	r.prom.MustRegister(r.IsLeader, r.BackendUp, r.ReplicationLag, r.Elections, r.LeaderAcquired, r.LeaderChanges,
+	r.prom.MustRegister(r.IsLeader, r.BackendUp, r.SlowProbes, r.OffsetElections, r.ReplicationLag, r.Elections, r.LeaderAcquired, r.LeaderChanges,
 		r.StepDowns, r.Fencing, r.ConsulErrors, r.ClientKills, r.ClientsKilled, r.Handovers, r.ProxyActive, r.ProxyDropped, r.ProxyRefused, r.ProxyAccepted, r.ProxyBytes, r.ProxyResets, renew, held,
 		r.LagSeconds, r.HeartbeatAge, r.Heartbeats, r.LagRefusals, r.PromotedDespiteLag, r.DespiteLagLeader,
 		r.BackupLastSuccess, r.BackupLastSize, r.BackupDuration, r.BackupFailures, r.WatchdogWrites,

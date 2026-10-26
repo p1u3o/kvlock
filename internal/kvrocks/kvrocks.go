@@ -39,6 +39,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,7 +117,8 @@ const ClientName = "kvlock-sidecar"
 type RedisClient struct {
 	rdb      *redis.Client
 	timeout  time.Duration
-	kind     string // "kvrocks" or "redis"
+	probe    time.Duration // Ping/InfoReplication timeout
+	kind     string        // "kvrocks" or "redis"
 	password string
 
 	peerMu   sync.Mutex
@@ -126,12 +129,29 @@ type RedisClient struct {
 // New creates a client for addr:port with optional password.
 // kind is "kvrocks" (default) or "redis"; unknown kinds behave like kvrocks.
 func New(addr string, port int, password string, timeout time.Duration, kind ...string) *RedisClient {
+	return NewWithProbe(addr, port, password, timeout, timeout, kind...)
+}
+
+// NewWithProbe is New with a separate timeout for the health probe (Ping
+// and InfoReplication): a kvrocks busy with heavy writes or a replica
+// sync can answer slowly without being dead.
+func NewWithProbe(addr string, port int, password string, timeout, probe time.Duration, kind ...string) *RedisClient {
+	if probe <= 0 {
+		probe = timeout
+	}
+	read := timeout
+	if probe > read {
+		read = probe
+	}
 	rdb := redis.NewClient(&redis.Options{
 		Addr:        fmt.Sprintf("%s:%d", addr, port),
 		Password:    password,
 		DialTimeout: timeout,
-		ReadTimeout: timeout,
-		ClientName:  ClientName,
+		ReadTimeout: read,
+		// Every call carries a context deadline (c.ctx), so per-command
+		// timeouts follow it: the probe may wait longer than other commands.
+		ContextTimeoutEnabled: true,
+		ClientName:            ClientName,
 		// One connection: the sidecar's load is tiny, and it means
 		// CLIENT KILL ... SKIPME yes spares every sidecar connection.
 		PoolSize: 1,
@@ -140,21 +160,42 @@ func New(addr string, port int, password string, timeout time.Duration, kind ...
 	if len(kind) > 0 && kind[0] != "" {
 		k = kind[0]
 	}
-	return &RedisClient{rdb: rdb, timeout: timeout, kind: k, password: password}
+	return &RedisClient{rdb: rdb, timeout: timeout, probe: probe, kind: k, password: password}
 }
 
 func (c *RedisClient) ctx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, c.timeout)
 }
 
+func (c *RedisClient) probeCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	d := c.probe
+	if d <= 0 {
+		d = c.timeout
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+// IsTimeout reports whether a probe error is a timeout (the instance is
+// slow or unreachable) rather than a refusal or protocol error (dead).
+func IsTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 func (c *RedisClient) Ping(ctx context.Context) error {
-	ctx, cancel := c.ctx(ctx)
+	ctx, cancel := c.probeCtx(ctx)
 	defer cancel()
 	return c.rdb.Ping(ctx).Err()
 }
 
 func (c *RedisClient) InfoReplication(ctx context.Context) (*ReplicationInfo, error) {
-	ctx, cancel := c.ctx(ctx)
+	ctx, cancel := c.probeCtx(ctx)
 	defer cancel()
 	s, err := c.rdb.Info(ctx, "replication").Result()
 	if err != nil {

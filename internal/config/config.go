@@ -40,6 +40,17 @@ type Config struct {
 	SessionTTL         time.Duration
 	LockDelay          time.Duration
 	UnhealthyThreshold int
+	// HealthTimeout bounds each health probe (PING + INFO) of the local
+	// instance. A probe that times out counts as slow, not dead.
+	HealthTimeout time.Duration
+	// SlowThreshold is how many consecutive slow (timed-out) probes count
+	// as the instance being down. Below it, a slow instance keeps its
+	// state, so a busy kvrocks under load does not lose leadership.
+	SlowThreshold int
+	// OffsetElect lets leaderless nodes compare published replication
+	// offsets so the most up-to-date live node can promote when its lag
+	// behind the old leader is unknown or it is a rejoining former leader.
+	OffsetElect bool
 
 	MaxLagBytes int64
 	HoldDown    time.Duration
@@ -254,7 +265,10 @@ func Parse(args []string) (*Config, error) {
 
 	fs.DurationVar(&c.SessionTTL, "session-ttl", getenvDur("SESSION_TTL", 10*time.Second), "Consul session TTL ($SESSION_TTL)")
 	fs.DurationVar(&c.LockDelay, "lock-delay", getenvDur("LOCK_DELAY", 1*time.Second), "Consul lock delay ($LOCK_DELAY)")
-	fs.IntVar(&c.UnhealthyThreshold, "unhealthy-threshold", getenvInt("UNHEALTHY_THRESHOLD", 3), "Consecutive failed kvrocks checks before releasing lock ($UNHEALTHY_THRESHOLD)")
+	fs.IntVar(&c.UnhealthyThreshold, "unhealthy-threshold", getenvInt("UNHEALTHY_THRESHOLD", 3), "Consecutive failed kvrocks checks (connection refused/reset, errors) before releasing lock ($UNHEALTHY_THRESHOLD)")
+	fs.DurationVar(&c.HealthTimeout, "health-timeout", getenvDur("HEALTH_TIMEOUT", 5*time.Second), "Timeout for each health probe of the local kvrocks; a probe that times out counts as slow, not dead ($HEALTH_TIMEOUT)")
+	fs.IntVar(&c.SlowThreshold, "unhealthy-slow-threshold", getenvInt("UNHEALTHY_SLOW_THRESHOLD", 4), "Consecutive slow (timed-out) health probes before kvrocks counts as down; below this a slow kvrocks keeps leadership ($UNHEALTHY_SLOW_THRESHOLD)")
+	fs.BoolVar(&c.OffsetElect, "offset-elect", getenvBool("OFFSET_ELECT", true), "With no leader, publish this node's replication offset and let the most up-to-date live node promote when its lag is unknown or it is a rejoining former leader; needs every known live peer's offset ($OFFSET_ELECT, default: on)")
 
 	fs.Int64Var(&c.MaxLagBytes, "max-lag", getenvInt64("MAX_LAG", getenvInt64("MAX_LAG_BYTES", -1)), "Max replication lag tolerated before refusing promotion, in the backend's offset units: write sequence numbers for kvrocks (default 1000), bytes for Redis (default 100MiB) ($MAX_LAG)")
 	fs.Int64Var(&c.MaxLagBytes, "max-lag-bytes", c.MaxLagBytes, "Old name for --max-lag ($MAX_LAG_BYTES)")
@@ -456,6 +470,12 @@ func Parse(args []string) (*Config, error) {
 	if c.LagSampleMaxAge <= 0 {
 		c.LagSampleMaxAge = 3 * c.CheckInterval
 	}
+	if c.HealthTimeout < 0 {
+		return nil, fmt.Errorf("--health-timeout must be >= 0")
+	}
+	if c.SlowThreshold < 1 {
+		return nil, fmt.Errorf("--unhealthy-slow-threshold must be >= 1")
+	}
 	if c.LagGateMaxWait < 0 {
 		return nil, fmt.Errorf("--lag-gate-max-wait must be >= 0")
 	}
@@ -517,6 +537,12 @@ func (c *Config) EpochKey() string {
 func (c *Config) MembersPrefix() string {
 	k := c.LeaderKey()
 	return k[:len(k)-len("leader")] + "members/"
+}
+
+// OffsetsPrefix holds one session-bound offset key per leaderless node.
+func (c *Config) OffsetsPrefix() string {
+	k := c.LeaderKey()
+	return k[:len(k)-len("leader")] + "offsets/"
 }
 
 func (c *Config) HeartbeatKey() string { return "kvlock:hb:" + c.Cluster }

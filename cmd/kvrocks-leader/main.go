@@ -53,7 +53,7 @@ func main() {
 	log := logx.New(cfg.NodeName, cfg.Mode)
 	reg := metrics.New()
 
-	kv := kvrocks.New(cfg.KvrocksAddr, cfg.KvrocksPort, cfg.KvrocksPassword, cfg.KvrocksTimeout, cfg.KVKind)
+	kv := kvrocks.NewWithProbe(cfg.KvrocksAddr, cfg.KvrocksPort, cfg.KvrocksPassword, cfg.KvrocksTimeout, cfg.HealthTimeout, cfg.KVKind)
 	defer kv.Close()
 
 	lc, err := live.New(cfg.ConsulAddr, cfg.ConsulToken, cfg.ConsulTLSCA, cfg.ConsulTLSSkipVerify)

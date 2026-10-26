@@ -3,6 +3,19 @@
 ## v0.2.2 (unreleased)
 
 ### Added
+- Offset election (`--offset-elect`, `$OFFSET_ELECT`, default on): with no
+  leader, sidecars publish their replication offset under
+  `kvrocks/<cluster>/offsets/` and the most up-to-date live node promotes even
+  if it is a restarted former leader or its lag is unknown. It needs a fresh
+  offset from every known live peer (and the old leader, if another node),
+  never promotes behind a live node, and breaks ties by lowest node name.
+  Fixes the deadlock where the restarted former leader deferred forever to a
+  peer the lag gate refused. Metric `kvlock_offset_elections_total`.
+- `--health-timeout` (default 5s) and `--unhealthy-slow-threshold` (default
+  4): a health probe that times out counts as slow, not dead, and keeps the
+  node's state until that many in a row. Refused or reset connections still
+  count toward `--unhealthy-threshold`. Metric
+  `kvlock_health_probe_slow_total`.
 - `--lag-gate-max-bytes` (`$LAG_GATE_MAX_BYTES`, 0 = off): a replica whose
   offset lag is over it never promotes, even after `--lag-gate-max-wait`. It
   is in the backend's offset units, so the default is backend-aware: 1000
@@ -20,6 +33,14 @@
   unbounded by default while a healthy peer exists.
 
 ### Fixed
+- A single slow health probe under load (e.g. while a replica resyncs)
+  marked kvrocks down, which withdrew the leader proxy route and cut every
+  client.
+- The leader proxy route key included this node's role and fence counter
+  even on replicas, so fencing or re-pointing a replica's own instance cut
+  its clients' connections to the unchanged remote leader. It now changes
+  only with the leader's session or epoch (plus role and fence state on
+  the leader itself).
 - The forwarder held clients for `--forward-hold` even when the answer was
   final (e.g. on the leader). It now refuses at once and holds only while
   the leader is unknown or changing.
