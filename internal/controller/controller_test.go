@@ -203,8 +203,9 @@ type fakeKV struct {
 	replicas          []kvrocks.ReplicaState
 	failReplicaOf     bool
 
-	downErr   error // returned while !up (default "down")
-	hang      bool  // InfoReplication blocks until the context ends
+	downErr   error         // returned while !up (default "down")
+	hang      bool          // InfoReplication blocks until the context ends
+	delay     time.Duration // InfoReplication answers this late (a busy replica)
 	rsidCalls int
 	rsidOK    int
 	setRO     int
@@ -268,6 +269,15 @@ func (f *fakeKV) InfoReplication(ctx context.Context) (*kvrocks.ReplicationInfo,
 		f.mu.Unlock()
 		<-ctx.Done()
 		return nil, ctx.Err()
+	}
+	if d := f.delay; d > 0 {
+		f.mu.Unlock()
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		f.mu.Lock()
 	}
 	defer f.mu.Unlock()
 	if !f.up {

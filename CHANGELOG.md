@@ -33,6 +33,15 @@
   unbounded by default while a healthy peer exists.
 
 ### Fixed
+- A replica catching up under heavy load no longer drops its proxy and
+  forwarder routes with "leadership state not confirmed with Consul". The
+  leader key was only re-read at the end of tick's local kvrocks calls, which
+  together could take longer than the session TTL on a busy replica. A
+  separate loop now re-reads the key every min(check-interval/2, 1s) and
+  refreshes the confirmation only when Consul shows the same holder session
+  and epoch; a new holder, a new epoch or a lost lock cuts routes at once.
+  New warnings `tick slow` and `tick reached the leader key late` show when
+  tick falls behind.
 - A single slow health probe under load (e.g. while a replica resyncs)
   marked kvrocks down, which withdrew the leader proxy route and cut every
   client.

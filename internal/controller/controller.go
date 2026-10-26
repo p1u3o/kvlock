@@ -318,6 +318,7 @@ func (c *Controller) Run(ctx context.Context) {
 	go c.watchLoop(ctx)
 	go c.backendReturnWatch(ctx)
 	go c.leaderVerifyLoop(ctx)
+	go c.leaderConfirmLoop(ctx)
 	if c.cfg.WatchdogFile != "" {
 		// Written in observe mode too (mode "observe" tells the watchdog
 		// to stay passive); it is a local file, not a cluster side effect.
@@ -447,6 +448,12 @@ func (c *Controller) isLeader() bool {
 
 // tick: health check, then election step.
 func (c *Controller) tick(ctx context.Context) {
+	start := time.Now()
+	defer func() {
+		if d := time.Since(start); d > c.cfg.CheckInterval && c.cfg.CheckInterval >= time.Second {
+			c.log.Warn("tick slow", map[string]any{"duration_ms": d.Milliseconds(), "check_interval_ms": c.cfg.CheckInterval.Milliseconds()})
+		}
+	}()
 	// 1. Health: PING + INFO with timeout. A probe that times out is
 	// "slow", not "dead": a kvrocks busy with heavy writes or a replica
 	// sync answers late. Slow probes keep the last known state until
@@ -526,6 +533,7 @@ func (c *Controller) tick(ctx context.Context) {
 	// the key, never by the node name in the value: the value survives a
 	// session release (behavior=release keeps it) and a restarted sidecar
 	// on the same node has a different session.
+	pre := time.Since(start)
 	raw, holder, _, err := c.deps.Lock.Get(ctx, c.cfg.LeaderKey())
 	if err != nil {
 		c.onConsulError(ctx, "lock", err)
@@ -535,6 +543,9 @@ func (c *Controller) tick(ctx context.Context) {
 	c.lastConsulOK = time.Now()
 	c.lastLockRead = c.lastConsulOK
 	c.mu.Unlock()
+	if pre > c.cfg.CheckInterval && c.cfg.CheckInterval >= time.Second {
+		c.log.Warn("tick reached the leader key late", map[string]any{"before_lock_ms": pre.Milliseconds()})
+	}
 	c.evaluate(ctx, ri, raw, holder, sid)
 	c.mu.RLock()
 	lagSeq := c.lag

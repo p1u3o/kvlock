@@ -267,3 +267,79 @@ func (c *Controller) verifyLeaderOnce(ctx context.Context) {
 	}
 	c.mu.Unlock()
 }
+
+// leaderConfirmLoop re-reads the leader key from Consul on its own
+// schedule, so route confirmation does not depend on tick. tick reads the
+// key only after its local kvrocks calls (probe, PSYNC check, sampling,
+// REPLICAOF), and on a replica catching up under heavy load those can
+// together take longer than the session TTL; routes were then cut with
+// "leadership state not confirmed with Consul" although nothing changed.
+//
+// It only refreshes lastLockRead when Consul shows the same holder session
+// and the same epoch as the leader the routes are built from. Any
+// difference is applied to c.leader at once (so ProxyView's key changes and
+// routes are cut) and a tick is triggered to act on it.
+func (c *Controller) leaderConfirmLoop(ctx context.Context) {
+	every := c.cfg.CheckInterval / 2
+	if every > time.Second {
+		every = time.Second
+	}
+	if every < 50*time.Millisecond {
+		every = 50 * time.Millisecond
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		c.confirmLeaderOnce(ctx)
+	}
+}
+
+func (c *Controller) confirmLeaderOnce(ctx context.Context) {
+	c.mu.RLock()
+	lv := c.leader
+	c.mu.RUnlock()
+	if lv == nil || lv.Session == "" {
+		return
+	}
+	timeout := c.cfg.SessionTTL / 4
+	if timeout <= 0 || timeout > 2*time.Second {
+		timeout = 2 * time.Second
+	}
+	gctx, cancel := context.WithTimeout(ctx, timeout)
+	raw, holder, _, err := c.deps.Lock.Get(gctx, c.cfg.LeaderKey())
+	cancel()
+	if err != nil {
+		return // no news; the TTL bound in routeConfirmedLocked still applies
+	}
+	now := time.Now()
+	cur := elect.ParseLeader(raw)
+	c.mu.Lock()
+	if c.leader != lv {
+		// tick or the watch replaced the leader meanwhile; this read may
+		// predate that, so ignore it.
+		c.mu.Unlock()
+		return
+	}
+	if holder != "" && holder == lv.Session && cur != nil && cur.Session == lv.Session && cur.Epoch == lv.Epoch {
+		c.lastLockRead = now
+		c.mu.Unlock()
+		return
+	}
+	// Changed or lost: stop routing to the old leader now.
+	if holder == "" {
+		c.leader = nil
+	} else {
+		c.leader = cur
+	}
+	c.mu.Unlock()
+	c.notify()
+	select {
+	case c.cmds <- func(ctx context.Context) { c.tick(ctx) }:
+	default:
+	}
+}
