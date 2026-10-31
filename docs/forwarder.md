@@ -131,7 +131,7 @@ gets:
   this version. Older versions compare member values to node names, so
   they would read a JSON value as some other live node.
 
-Clients can keep using the leader proxy (`--proxy-write-addr`) or the
+Clients can keep using the leader proxy (`--proxy-addr`) or the
 forwarder address on every host to find the master.
 
 ## Configuration

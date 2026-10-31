@@ -1,6 +1,8 @@
 # Changelog
 
-## v0.2.2 (unreleased)
+## v0.3.0
+
+Known issues are listed in `TODO.md`.
 
 ### Added
 - Offset election (`--offset-elect`, `$OFFSET_ELECT`, default on): with no
