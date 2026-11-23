@@ -99,3 +99,15 @@ func TestEnsureRsIDPsyncRedisNoop(t *testing.T) {
 		t.Fatalf("redis kind should skip use-rsid-psync, got %v", err)
 	}
 }
+
+func TestParseInfoReplicationMasterReplID(t *testing.T) {
+	s := "# Replication\r\nrole:master\r\nmaster_replid:abc123\r\nmaster_repl_offset:42\r\n"
+	ri := kvrocks.ParseInfoReplication(s)
+	if ri.MasterReplID != "abc123" {
+		t.Fatalf("replid=%q", ri.MasterReplID)
+	}
+	// Absent field must stay empty rather than a stale value.
+	if got := kvrocks.ParseInfoReplication("role:master\r\n"); got.MasterReplID != "" {
+		t.Fatalf("replid=%q", got.MasterReplID)
+	}
+}

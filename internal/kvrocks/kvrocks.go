@@ -61,6 +61,10 @@ type ReplicationInfo struct {
 	ConnectedSlaves int
 	Replicas        []ReplicaState // slaveN lines (master only)
 	Raw             string
+	// MasterReplID identifies the replication stream (master_replid). Two
+	// addresses reporting the same non-empty id are the same instance seen
+	// through different proxies, not a split brain.
+	MasterReplID string
 }
 
 // ReplicaState is one slaveN line as seen by a master.
@@ -449,6 +453,7 @@ func ParseInfoReplication(s string) *ReplicationInfo {
 		ri.MasterPort = p
 	}
 	ri.MasterLinkUp = kv["master_link_status"] == "up"
+	ri.MasterReplID = kv["master_replid"]
 	if n, err := strconv.Atoi(kv["connected_slaves"]); err == nil {
 		ri.ConnectedSlaves = n
 	}

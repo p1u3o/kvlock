@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/p1u3o/kvlock/internal/kvrocks"
 )
 
 // RefusedPort is never a valid target: it is the production port.
@@ -187,12 +189,16 @@ func (r *runner) findMaster(ctx context.Context) (string, error) {
 		return r.cfg.Addrs[0], nil
 	}
 	var masters []string
+	replIDs := map[string][]string{}
 	for _, a := range r.cfg.Addrs {
 		c, cancel := context.WithTimeout(ctx, r.cfg.OpTimeout)
 		s, err := r.client(a).Info(c, "replication").Result()
 		cancel()
 		if err == nil && strings.Contains(s, "role:master") {
 			masters = append(masters, a)
+			if ri := kvrocks.ParseInfoReplication(s); ri.MasterReplID != "" {
+				replIDs[ri.MasterReplID] = append(replIDs[ri.MasterReplID], a)
+			}
 		}
 	}
 	switch len(masters) {
@@ -201,6 +207,16 @@ func (r *runner) findMaster(ctx context.Context) (string, error) {
 	case 1:
 		return masters[0], nil
 	default:
+		// Every write proxy forwards INFO to the current primary, so a run
+		// against two proxies sees the same instance twice. Only warn when the
+		// addresses actually carry different replication streams.
+		if len(replIDs) == 1 {
+			for _, group := range replIDs {
+				if len(group) == len(masters) {
+					return masters[0], nil
+				}
+			}
+		}
 		r.note("WARNING: several masters visible: " + strings.Join(masters, ","))
 		return masters[0], nil
 	}

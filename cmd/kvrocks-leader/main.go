@@ -51,6 +51,9 @@ func main() {
 		os.Exit(2)
 	}
 	log := logx.New(cfg.NodeName, cfg.Mode)
+	for _, w := range cfg.AdvertiseWarnings {
+		log.Warn(w, nil)
+	}
 	reg := metrics.New()
 
 	kv := kvrocks.NewWithProbe(cfg.KvrocksAddr, cfg.KvrocksPort, cfg.KvrocksPassword, cfg.KvrocksTimeout, cfg.HealthTimeout, cfg.KVKind)

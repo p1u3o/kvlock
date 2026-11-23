@@ -123,6 +123,10 @@ type Config struct {
 	// NOMAD_HOST_ADDR_<label> (Nomad dynamic ports). Explicit
 	// --advertise-addr / --advertise-port still win.
 	AdvertiseNomadLabel string
+	// AdvertiseWarnings are non-fatal problems with the advertised address
+	// that the operator should see at startup (e.g. a container-local bridge
+	// address that a peer on another host can never reach).
+	AdvertiseWarnings []string
 	// ReplicaAnnounce makes kvlock CONFIG SET replica-announce-ip/-port
 	// on its kvrocks when forwarding is enabled (default true). Turn it
 	// off to keep values from the kvrocks config file.
@@ -375,6 +379,21 @@ func Parse(args []string) (*Config, error) {
 		}
 		if c.AdvertisePort == 0 {
 			c.AdvertisePort = port
+		}
+		// In a Nomad bridge network the port is published on the host, but
+		// NOMAD_HOST_ADDR_<label> can carry the bridge gateway (172.26.x,
+		// 172.17.x). A peer node cannot route that, so replicas would follow
+		// an address only this host can reach. Say so instead of failing
+		// silently; the fallback pair is named in the message.
+		if ip := net.ParseIP(h); ip != nil && ip.To4() != nil && inDockerBridge(ip) {
+			alt := os.Getenv("NOMAD_HOST_IP_" + c.AdvertiseNomadLabel)
+			altPort := os.Getenv("NOMAD_HOST_PORT_" + c.AdvertiseNomadLabel)
+			msg := fmt.Sprintf("advertised address %s looks container-local (docker/Nomad bridge); "+
+				"a peer on another host cannot reach it", hp)
+			if alt != "" && net.ParseIP(alt) != nil && !inDockerBridge(net.ParseIP(alt)) {
+				msg += fmt.Sprintf("; consider --advertise-addr %s --advertise-port %s", alt, altPort)
+			}
+			c.AdvertiseWarnings = append(c.AdvertiseWarnings, msg)
 		}
 	}
 	if c.AdvertiseAddr == "" {
@@ -681,4 +700,16 @@ func (c *Config) PeerAddr(i int) (string, error) {
 	ip = append(net.IP(nil), ip...)
 	ip[3] = byte(i)
 	return net.JoinHostPort(ip.String(), strconv.Itoa(c.PeerPort)), nil
+}
+
+// inDockerBridge reports whether ip is inside 172.16.0.0/12, the range Docker
+// and Nomad allocate to bridge networks and container gateways. Addresses here
+// exist only inside a host, so they are wrong in a value meant for peers.
+func inDockerBridge(ip net.IP) bool {
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	// 172.16.0.0 - 172.31.255.255
+	return v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31
 }

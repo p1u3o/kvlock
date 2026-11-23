@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -100,5 +101,40 @@ func TestLagGateDefaults(t *testing.T) {
 	}
 	if o, _ := config.Parse([]string{"--lag-gate-max-bytes=0"}); o == nil || o.LagGateMaxBytes != 0 {
 		t.Fatal("0 must turn the cap off")
+	}
+}
+
+func TestAdvertiseNomadLabelWarnsOnBridgeAddress(t *testing.T) {
+	t.Setenv("NOMAD_HOST_ADDR_redis", "172.26.64.1:31158")
+	t.Setenv("NOMAD_HOST_IP_redis", "100.93.37.207")
+	t.Setenv("NOMAD_HOST_PORT_redis", "31158")
+	c, err := config.Parse([]string{"--advertise-nomad-label=redis"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.AdvertiseWarnings) != 1 {
+		t.Fatalf("warnings=%v", c.AdvertiseWarnings)
+	}
+	if !strings.Contains(c.AdvertiseWarnings[0], "container-local") {
+		t.Fatalf("warning=%q", c.AdvertiseWarnings[0])
+	}
+	if !strings.Contains(c.AdvertiseWarnings[0], "100.93.37.207") {
+		t.Fatalf("warning does not name the fallback: %q", c.AdvertiseWarnings[0])
+	}
+}
+
+func TestAdvertiseNomadLabelHostAddressIsQuiet(t *testing.T) {
+	t.Setenv("NOMAD_HOST_ADDR_redis", "100.93.37.207:31158")
+	t.Setenv("NOMAD_HOST_IP_redis", "100.93.37.207")
+	t.Setenv("NOMAD_HOST_PORT_redis", "31158")
+	c, err := config.Parse([]string{"--advertise-nomad-label=redis"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.AdvertiseWarnings) != 0 {
+		t.Fatalf("warnings=%v", c.AdvertiseWarnings)
+	}
+	if c.AdvertiseAddr != "100.93.37.207" || c.AdvertisePort != 31158 {
+		t.Fatalf("advertise=%v:%v", c.AdvertiseAddr, c.AdvertisePort)
 	}
 }

@@ -202,6 +202,30 @@ below that), `replica-read-only`/`slave-read-only` — is shared. Re-run
 the failure-mode scenarios against Redis before relying on the timings
 above, as PSYNC/full-sync dynamics differ from kvrocks.
 
+#### Session-store profile
+
+For an ephemeral store where a stale value is worthless and a long write
+outage is not — PHP sessions, caches, rate-limit counters — the safe defaults
+are the wrong trade. The lag gate refuses to promote a replica that is behind
+(`--lag-gate-max-wait 0`), which protects durable data but leaves every write
+failing until the old master comes back. A measured pair (Valkey 9.1.2, two
+prod nodes, kill -9 of the primary under load) with this profile:
+
+```sh
+kvrocks-leader --kv-kind=redis \
+  --check-interval 1s \        # detect a dead backend in ~3s, not ~9s
+  --lock-delay 1s \
+  --lag-sample-max-age 5s \    # a dead instance always exceeds the 3s default
+  --lag-gate-max-wait 5s \     # promote a slightly stale replica after 5s
+  --session-ttl 10s
+```
+
+promoted in 4.7s with a 2.8s write gap, zero lost acknowledged writes and
+zero stale reads in the same run. The cost is explicit: if the old master was
+ahead and had not replicated, the difference is dropped instead of blocking
+writes. Do not use this profile for durable data; there the default refusal
+to promote is the correct behaviour.
+
 ## Split-brain window
 
 If the old master is partitioned from Consul but still reachable by
